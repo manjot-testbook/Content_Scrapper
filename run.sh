@@ -406,6 +406,7 @@ case "$CMD" in
     fix-net)      cmd_fixnet ;;
     install-cert) cmd_install_cert "$@" ;;
     patch-apk)    cmd_patch_apk "$@" ;;
+    setup)        "$PYTHON" "$PROJECT/scripts/setup_capture.py" "$@" ;;
     install)      cmd_install "$@" ;;
     patch)        cmd_patch ;;
     proxy)    cmd_proxy ;;
