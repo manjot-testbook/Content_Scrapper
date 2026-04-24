@@ -200,6 +200,19 @@ clear_device_proxy() {
 
 # ── commands ──────────────────────────────────────────────────────────────────
 
+cmd_install_cert() {
+    "$PYTHON" "$PROJECT/scripts/install_system_cert.py" "$@"
+}
+
+cmd_patch_apk() {
+    log "Checking for apktool..."
+    if ! command -v apktool &>/dev/null; then
+        warn "apktool not found — installing via brew..."
+        brew install apktool
+    fi
+    "$PYTHON" "$PROJECT/scripts/patch_apk.py" "$@"
+}
+
 cmd_fixnet() {
     log "Clearing stale proxy settings from emulator..."
     clear_device_proxy
@@ -308,8 +321,10 @@ shift 2>/dev/null || true
 case "$CMD" in
     status)   cmd_status ;;
     emulator) cmd_emulator ;;
-    fix-net)  cmd_fixnet ;;
-    install)  cmd_install "$@" ;;
+    fix-net)      cmd_fixnet ;;
+    install-cert) cmd_install_cert "$@" ;;
+    patch-apk)    cmd_patch_apk "$@" ;;
+    install)      cmd_install "$@" ;;
     proxy)    cmd_proxy ;;
     stop)     cmd_stop ;;
     navigate) cmd_navigate "$@" ;;
