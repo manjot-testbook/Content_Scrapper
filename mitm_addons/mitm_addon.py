@@ -1,133 +1,39 @@
-"""
-mitm_addon.py — mitmproxy addon that captures all HTTP(S) requests/responses
-and saves them to a structured JSON log for API analysis.
-
-Usage:
-    mitmdump -s mitm_addons/mitm_addon.py --set confdir=~/.mitmproxy
-"""
-
-import json
-import os
-import time
+#!/usr/bin/env python3
+"""KukuTV mitmproxy addon — captures all HTTPS traffic."""
+import json, os
 from datetime import datetime, timezone
-from pathlib import Path
-from urllib.parse import urlparse
+from mitmproxy import http
 
-from mitmproxy import http, ctx
+KUKU = ["kukufm", "kuku.fm", "aravali", "vlv.com"]
+OUT  = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                    "metadata", "captured_apis", "api_traffic.jsonl")
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
 
-# Output directory
-LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "metadata", "captured_apis")
-os.makedirs(LOG_DIR, exist_ok=True)
+def response(flow: http.HTTPFlow):
+    url  = flow.request.pretty_url
+    host = flow.request.pretty_host
+    is_kuku = any(k in url or k in host for k in KUKU)
 
-# Master log file
-MASTER_LOG = os.path.join(LOG_DIR, "api_traffic.jsonl")
+    try: body = json.loads(flow.request.get_text(strict=False) or "")
+    except: body = flow.request.get_text(strict=False) or None
 
-# Track unique endpoints
-seen_endpoints: set[str] = set()
+    try: rbody = json.loads(flow.response.get_text(strict=False) or "")
+    except: rbody = None
 
+    with open(OUT, "a") as f:
+        f.write(json.dumps({
+            "ts":       datetime.now(timezone.utc).isoformat(),
+            "method":   flow.request.method,
+            "url":      url,
+            "host":     host,
+            "path":     flow.request.path.split("?")[0],
+            "req_hdrs": dict(flow.request.headers),
+            "req_body": body,
+            "status":   flow.response.status_code if flow.response else None,
+            "res_hdrs": dict(flow.response.headers) if flow.response else {},
+            "res_body": rbody,
+            "is_kuku":  is_kuku,
+        }) + "\n")
 
-class KukuTVCapture:
-    """Capture and log all API traffic, with special attention to KukuTV domains."""
-
-    def __init__(self):
-        self.request_count = 0
-        self.kukutv_count = 0
-
-    def response(self, flow: http.HTTPFlow) -> None:
-        self.request_count += 1
-
-        request = flow.request
-        response = flow.response
-        parsed = urlparse(request.pretty_url)
-
-        # Build record
-        record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "method": request.method,
-            "url": request.pretty_url,
-            "host": parsed.hostname,
-            "path": parsed.path,
-            "query": parsed.query,
-            "request_headers": dict(request.headers),
-            "request_body": None,
-            "status_code": response.status_code if response else None,
-            "response_headers": dict(response.headers) if response else None,
-            "response_body": None,
-            "content_type": response.headers.get("content-type", "") if response else "",
-        }
-
-        # Capture request body for POST/PUT/PATCH
-        if request.method in ("POST", "PUT", "PATCH") and request.content:
-            try:
-                record["request_body"] = json.loads(request.content)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                record["request_body"] = request.content.decode("utf-8", errors="replace")[:2000]
-
-        # Capture response body (only JSON/text, skip binary/video)
-        if response and response.content:
-            ct = response.headers.get("content-type", "")
-            if "json" in ct or "text" in ct or "xml" in ct:
-                try:
-                    record["response_body"] = json.loads(response.content)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    record["response_body"] = response.content.decode("utf-8", errors="replace")[:5000]
-            elif "video" in ct or "audio" in ct or "octet-stream" in ct:
-                record["response_body"] = f"<binary: {len(response.content)} bytes>"
-
-        # Check if this is a KukuTV / Aravali / VLV-related request
-        # Package: com.vlv.aravali.reels — API domains may not contain "kuku"
-        is_kukutv = False
-        host = (parsed.hostname or "").lower()
-        KUKU_KEYWORDS = [
-            "kuku", "kukutv", "kukufm",
-            "vlv", "aravali",               # APK vendor names
-        ]
-        # Mark well-known pure third-party hosts so we don't flag them
-        SKIP_HOSTS = [
-            "google", "firebase", "crashlytics", "appsflyer",
-            "facebook", "branch.io", "adjust", "amplitude",
-            "doubleclick", "googleapis", "gstatic",
-        ]
-        is_third_party = any(s in host for s in SKIP_HOSTS)
-        if any(kw in host for kw in KUKU_KEYWORDS) or not is_third_party:
-            is_kukutv = True
-            self.kukutv_count += 1
-
-        record["is_kukutv"] = is_kukutv
-
-        # Log endpoint signature for dedup tracking
-        endpoint_sig = f"{request.method} {parsed.hostname}{parsed.path}"
-        is_new = endpoint_sig not in seen_endpoints
-        seen_endpoints.add(endpoint_sig)
-        record["is_new_endpoint"] = is_new
-
-        # Write to master JSONL log
-        with open(MASTER_LOG, "a") as f:
-            f.write(json.dumps(record, default=str) + "\n")
-
-        # If it's a KukuTV API and new, also save individual response
-        if is_kukutv and is_new and response:
-            safe_path = parsed.path.replace("/", "_").strip("_") or "root"
-            filename = f"{request.method}_{safe_path}_{response.status_code}.json"
-            filepath = os.path.join(LOG_DIR, filename)
-            with open(filepath, "w") as f:
-                json.dump(record, f, indent=2, default=str)
-
-        # Log to console
-        marker = "🟢 KUKU" if is_kukutv else "⚪"
-        new_tag = " [NEW]" if is_new else ""
-        ctx.log.info(
-            f"{marker}{new_tag} {request.method} {response.status_code if response else '???'} "
-            f"{request.pretty_url[:120]}"
-        )
-
-    def done(self):
-        ctx.log.info(f"\n{'='*60}")
-        ctx.log.info(f"Total requests captured: {self.request_count}")
-        ctx.log.info(f"KukuTV requests: {self.kukutv_count}")
-        ctx.log.info(f"Unique endpoints: {len(seen_endpoints)}")
-        ctx.log.info(f"Logs saved to: {LOG_DIR}")
-        ctx.log.info(f"{'='*60}")
-
-
-addons = [KukuTVCapture()]
+    if is_kuku:
+        print(f"[KUKU] {flow.request.method} {url[:120]}")
