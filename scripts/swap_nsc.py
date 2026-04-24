@@ -52,15 +52,15 @@ def sign(src, dst):
 
 def compile_nsc_binary(tmp):
     """Compile NSC XML → binary XML using aapt2."""
-    xml_path = os.path.join(tmp, "network_security_config.xml")
+    # aapt2 requires the file to be inside a res/xml/ directory structure
+    res_xml_dir = os.path.join(tmp, "res", "xml")
+    os.makedirs(res_xml_dir, exist_ok=True)
+    xml_path = os.path.join(res_xml_dir, "network_security_config.xml")
     flat_dir  = os.path.join(tmp, "flat")
     os.makedirs(flat_dir, exist_ok=True)
     with open(xml_path, "wb") as f:
         f.write(NSC_XML)
 
-    android_jar = sorted(glob.glob(os.path.join(SDK, "platforms", "android-*", "android.jar")), reverse=True)
-    if not android_jar:
-        print("ERROR: android.jar not found"); sys.exit(1)
 
     # Compile XML to flat
     _, err, code = run([AAPT2, "compile", "--legacy", xml_path, "-o", flat_dir])
@@ -182,22 +182,35 @@ def main():
             signed_splits.append(dst)
             print(f"  ✓ {os.path.basename(s)}")
 
-        # Install
-        print(f"\n[5] Installing {1 + len(signed_splits)} APKs ...")
+        # Install — try -r first (keeps data, keeps login session)
+        print(f"\n[5] Installing {1 + len(signed_splits)} APKs (-r = keep data)...")
         all_apks = [signed_base] + signed_splits
         out, err, code = run([ADB, "install-multiple", "-r", "-d"] + all_apks)
         print(f"  stdout: {out}")
-        print(f"  stderr: {err[:200]}")
+        print(f"  stderr: {err[:300]}")
 
         if code == 0 or "Success" in out:
             print("\n✓ Patched KukuTV installed — mitmproxy CA is now trusted!")
             print("  Launch app, then: ./run.sh capture")
-        elif "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in err:
-            print("\nSignature mismatch — uninstalling (app data will be lost)...")
-            adb("uninstall", PACKAGE)
-            out2, err2, code2 = run([ADB, "install-multiple"] + all_apks)
-            if code2 == 0 or "Success" in out2:
-                print("✓ Installed after uninstall. Log in again, then: ./run.sh capture")
+        elif "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in err or "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in out:
+            print("\n[!] Signature mismatch detected.")
+            print("    The Play Store version has a different signature than the debug-signed patched APK.")
+            print("    Uninstalling will LOG YOU OUT of KukuTV (OTP required again).")
+            ans = input("    Do you want to uninstall and reinstall? [y/N]: ").strip().lower()
+            if ans == "y":
+                print("  Uninstalling...")
+                adb("uninstall", PACKAGE)
+                out2, err2, code2 = run([ADB, "install-multiple", "-d"] + all_apks)
+                if code2 == 0 or "Success" in out2:
+                    print("✓ Installed. Log back into KukuTV, then: ./run.sh capture")
+                else:
+                    print(f"✗ Install failed: {err2[:300]}")
+            else:
+                print("\n[Cancelled] App NOT uninstalled — your session is preserved.")
+                print("Alternative: use system cert method to avoid reinstall:")
+                print("  Restart emulator with -writable-system, then run: ./run.sh install-cert")
+        else:
+            print(f"✗ Install failed: {err[:300]}")
             else:
                 print(f"✗ Failed: {err2[:300]}")
         else:

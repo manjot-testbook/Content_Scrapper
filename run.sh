@@ -5,7 +5,8 @@
 # Usage:
 #   ./run.sh emulator  → start Android emulator (Play Store AVD required)
 #   ./run.sh install   → open Play Store on device to install KukuTV
-#   ./run.sh patch     → pull APK from device, patch NSC to trust user CAs, reinstall
+#   ./run.sh patch              → install mitmproxy CA as system cert (preserves login); falls back to APK patch
+#   ./run.sh writable-emulator  → restart emulator with -writable-system so system cert can be installed
 #   ./run.sh capture   → start proxy + navigate app + capture APIs
 #   ./run.sh analyze   → analyze captured traffic
 #   ./run.sh scrape    → download videos from discovered URLs
@@ -242,8 +243,74 @@ cmd_install() {
 
 cmd_patch() {
     check_device
-    log "Patching KukuTV NSC to trust mitmproxy CA (user certificates)..."
-    "$PYTHON" "$PROJECT/scripts/swap_nsc.py"
+
+    # ── Strategy 1: Install mitmproxy CA as SYSTEM cert (no reinstall, session preserved) ──
+    log "Trying to install mitmproxy CA as system certificate (preserves your login session)..."
+    if "$PYTHON" "$PROJECT/scripts/install_system_cert.py" 2>/dev/null; then
+        ok "System cert installed — your KukuTV session is intact."
+        log "Now run:  ./run.sh proxy   then open the app and browse manually."
+        return 0
+    fi
+
+    # ── Strategy 2: Restart emulator with -writable-system, then install system cert ──
+    warn "Direct root not available (Play Store emulator)."
+    warn "Best option: restart emulator with -writable-system to install cert without touching the app."
+    echo ""
+    echo "  Run these commands in a new terminal:"
+    echo "    # 1. Find your AVD name:"
+    echo "    ~/Library/Android/sdk/emulator/emulator -list-avds"
+    echo ""
+    echo "    # 2. Kill current emulator:"
+    echo "    adb emu kill"
+    echo ""
+    echo "    # 3. Restart with writable system:"
+    echo "    ~/Library/Android/sdk/emulator/emulator -avd Medium_Phone -writable-system -no-snapshot-save &"
+    echo ""
+    echo "    # 4. Wait for boot, then:"
+    echo "    adb wait-for-device && adb root && adb remount"
+    echo "    ./run.sh install-cert"
+    echo ""
+    echo "  Your app data (login session) is stored in /data and will NOT be wiped."
+    echo ""
+
+    # ── Strategy 3: Patch APK NSC (will ask before uninstalling) ──
+    log "Alternatively: patch the APK's network_security_config (may require reinstall)..."
+    read -r -p "  Try APK patching now? WARNING: may log you out if signature mismatch. [y/N]: " ans
+    if [[ "${ans,,}" == "y" ]]; then
+        log "Patching KukuTV NSC to trust mitmproxy CA (user certificates)..."
+        "$PYTHON" "$PROJECT/scripts/swap_nsc.py"
+    else
+        log "Skipped. Use the -writable-system method above to avoid losing your session."
+    fi
+}
+
+cmd_writable_emulator() {
+    # Restart the current Play Store AVD with -writable-system so we can push system certs
+    local avd="${1:-Medium_Phone}"
+    log "Killing running emulator..."
+    "$ADB" emu kill 2>/dev/null || true
+    sleep 3
+    mkdir -p "$PROJECT/logs"
+    log "Restarting '$avd' with -writable-system (app data preserved)..."
+    nohup "$EMULATOR" -avd "$avd" -writable-system -no-snapshot-save -no-audio \
+        > "$PROJECT/logs/emulator.log" 2>&1 &
+    echo $! > "$PROJECT/logs/emulator.pid"
+    log "Waiting for boot..."
+    local waited=0
+    while [ $waited -lt 150 ]; do
+        local boot
+        boot=$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+        if [ "$boot" = "1" ]; then
+            ok "Emulator booted with writable system partition"
+            log "Enabling root + remounting..."
+            "$ADB" root && sleep 2 && "$ADB" remount && sleep 1
+            ok "Ready — now run:  ./run.sh install-cert"
+            return 0
+        fi
+        sleep 5; waited=$((waited+5)); echo -n "."
+    done
+    echo ""
+    warn "Boot timed out — try: adb root && adb remount && ./run.sh install-cert"
 }
 
 cmd_emulator() {
@@ -335,6 +402,7 @@ shift 2>/dev/null || true
 case "$CMD" in
     status)   cmd_status ;;
     emulator) cmd_emulator ;;
+    writable-emulator) cmd_writable_emulator "$@" ;;
     fix-net)      cmd_fixnet ;;
     install-cert) cmd_install_cert "$@" ;;
     patch-apk)    cmd_patch_apk "$@" ;;
