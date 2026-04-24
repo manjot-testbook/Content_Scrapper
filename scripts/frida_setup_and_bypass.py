@@ -1,227 +1,222 @@
 #!/usr/bin/env python3
 """
-frida_setup_and_bypass.py — One shot: download frida-server, push to device,
-start it, launch KukuTV, inject SSL bypass, then run mitmproxy.
+frida_setup_and_bypass.py — Attach Frida SSL bypass to a running KukuTV process.
+
+Steps:
+  1. Finds the emulator where KukuTV is installed
+  2. Pushes + starts frida-server (works on emulators even without root due to permissive SELinux)
+  3. Starts mitmproxy + sets proxy
+  4. Waits for you to open KukuTV manually
+  5. Attaches Frida SSL bypass to the running process
 
 Run: python scripts/frida_setup_and_bypass.py
 """
-import os, subprocess, sys, urllib.request, lzma, shutil, time, socket, json
+import os, subprocess, sys, urllib.request, lzma, shutil, time, socket
 
 ADB     = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE = "com.vlv.aravali.reels"
-FRIDA_SERVER_DEVICE_PATH = "/data/local/tmp/frida-server"
+FRIDA_DEVICE_PATH = "/data/local/tmp/frida-server"
 FRIDA_VERSION = "17.9.1"
 
-def adb(*args):
-    r = subprocess.run([ADB] + list(args), capture_output=True, text=True)
+def adb(*args, serial=None):
+    cmd = [ADB]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += list(args)
+    r = subprocess.run(cmd, capture_output=True, text=True)
     return r.stdout.strip(), r.stderr.strip(), r.returncode
 
-def sh(cmd):
-    out, err, _ = adb("shell", cmd)
+def sh(cmd, serial=None):
+    out, err, _ = adb("shell", cmd, serial=serial)
     return (out + err).strip()
 
-# ── 0. Check device ───────────────────────────────────────────────────────────
-print("\n=== Frida SSL Bypass Setup ===\n")
-out, _, _ = adb("devices")
-if "emulator" not in out and "device" not in out.split("\n",1)[-1]:
-    print("ERROR: No emulator connected."); sys.exit(1)
+def get_devices():
+    out, _, _ = adb("devices")
+    return [l.split("\t")[0] for l in out.splitlines()[1:] if "\tdevice" in l]
 
-# Get device arch
-arch = sh("getprop ro.product.cpu.abi").strip()
-# Map to frida arch name
+def find_kuku_device(devices):
+    for d in devices:
+        out, _, _ = adb("shell", f"pm list packages | grep {PACKAGE}", serial=d)
+        if PACKAGE in out:
+            return d
+    return None
+
+def wait_for_process(serial, timeout=120):
+    print(f"  Waiting for KukuTV to be opened (up to {timeout}s)...", end="", flush=True)
+    for _ in range(timeout // 3):
+        out = sh(f"pidof {PACKAGE} 2>/dev/null", serial=serial)
+        if out.strip():
+            print(f" found PID {out.strip()} ✓")
+            return out.strip()
+        time.sleep(3); print(".", end="", flush=True)
+    print(" TIMEOUT")
+    return None
+
+print("\n=== Frida SSL Bypass (Attach Mode) ===\n")
+
+# ── 0. Find the right device ──────────────────────────────────────────────────
+devices = get_devices()
+print(f"[0] Connected devices: {devices}")
+
+serial = find_kuku_device(devices)
+if not serial:
+    print(f"ERROR: KukuTV ({PACKAGE}) not found on any connected device.")
+    print("Make sure Medium_Phone emulator is running with KukuTV installed.")
+    sys.exit(1)
+
+print(f"    ✓ KukuTV found on: {serial}")
+avd_name = sh("getprop ro.kernel.qemu.avd_name 2>/dev/null || getprop ro.boot.qemu.avd_name 2>/dev/null", serial=serial)
+print(f"    AVD: {avd_name or 'unknown'}")
+
+# ── 1. Get device arch + download frida-server ────────────────────────────────
+arch = sh("getprop ro.product.cpu.abi", serial=serial)
 frida_arch = {"arm64-v8a": "arm64", "armeabi-v7a": "arm", "x86_64": "x86_64", "x86": "x86"}.get(arch, "arm64")
-print(f"Device arch: {arch} → frida arch: {frida_arch}")
+print(f"\n[1] Device arch: {arch} → frida: {frida_arch}")
 
-# ── 1. Download frida-server ──────────────────────────────────────────────────
 frida_local = f"/tmp/frida-server-{FRIDA_VERSION}-{frida_arch}"
 if os.path.isfile(frida_local) and os.path.getsize(frida_local) > 1_000_000:
-    print(f"[1] Using cached frida-server: {frida_local}")
+    print(f"    Using cached: {frida_local}")
 else:
     url = f"https://github.com/frida/frida/releases/download/{FRIDA_VERSION}/frida-server-{FRIDA_VERSION}-android-{frida_arch}.xz"
-    xz_path = frida_local + ".xz"
-    print(f"[1] Downloading frida-server {FRIDA_VERSION} ({frida_arch})...")
-    print(f"    {url}")
-    try:
-        urllib.request.urlretrieve(url, xz_path)
-        print(f"    Downloaded {os.path.getsize(xz_path)//1024}KB — decompressing...")
-        with lzma.open(xz_path) as xz_f, open(frida_local, "wb") as out_f:
-            shutil.copyfileobj(xz_f, out_f)
-        os.remove(xz_path)
-        print(f"    Extracted: {os.path.getsize(frida_local)//1024}KB")
-    except Exception as e:
-        print(f"    FAILED: {e}"); sys.exit(1)
+    print(f"    Downloading frida-server...")
+    xz = frida_local + ".xz"
+    urllib.request.urlretrieve(url, xz)
+    with lzma.open(xz) as xf, open(frida_local, "wb") as of:
+        shutil.copyfileobj(xf, of)
+    os.remove(xz)
+    print(f"    ✓ {os.path.getsize(frida_local)//1024}KB")
 
-# ── 2. Push frida-server to device ───────────────────────────────────────────
-print("\n[2] Pushing frida-server to device...")
-adb("push", frida_local, FRIDA_SERVER_DEVICE_PATH)
-sh(f"chmod 755 {FRIDA_SERVER_DEVICE_PATH}")
-print("    ✓ Pushed and made executable")
-
-# ── 3. Kill any existing frida-server, start fresh ───────────────────────────
-print("\n[3] Starting frida-server on device...")
-sh("pkill -f frida-server 2>/dev/null; true")
+# ── 2. Push + start frida-server ─────────────────────────────────────────────
+print("\n[2] Starting frida-server on device...")
+sh(f"pkill -f frida-server 2>/dev/null; true", serial=serial)
 time.sleep(1)
 
-# Try adb root first (works on google_apis), fall back to shell user (works for spawn on emulators)
-root_out, _, _ = adb("root")
-time.sleep(2)
-is_rooted = "cannot run as root" not in root_out
+adb("push", frida_local, FRIDA_DEVICE_PATH, serial=serial)
+sh(f"chmod 755 {FRIDA_DEVICE_PATH}", serial=serial)
 
-# Start frida-server in background - use su if available, otherwise shell
-start_cmd = f"nohup {FRIDA_SERVER_DEVICE_PATH} >/dev/null 2>&1 &"
-adb("shell", start_cmd)
+# Try root first, then shell user (emulators have permissive SELinux)
+root_out, _, _ = adb("root", serial=serial)
+time.sleep(3)
+is_rooted = "cannot run as root" not in root_out
+print(f"    Root: {'✓' if is_rooted else '✗ (will try shell user)'}")
+
+# Start frida-server as background process
+p = subprocess.Popen(
+    [ADB, "-s", serial, "shell", f"{FRIDA_DEVICE_PATH}"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+)
 time.sleep(4)
 
-# Verify it's running
-out = sh("ps -A 2>/dev/null | grep frida-server | grep -v grep | head -1")
-if out:
-    print(f"    ✓ frida-server running (rooted: {is_rooted})")
+# Verify
+running = sh(f"ps -A 2>/dev/null | grep frida-server | grep -v grep", serial=serial)
+if running:
+    print(f"    ✓ frida-server running")
 else:
-    print(f"    ! frida-server didn't start — trying alternate method...")
-    # Try running directly (blocking start, then we detach)
-    p = subprocess.Popen([ADB, "shell", FRIDA_SERVER_DEVICE_PATH],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(4)
-    out = sh("ps -A 2>/dev/null | grep frida-server | grep -v grep | head -1")
-    if out:
-        print(f"    ✓ frida-server running")
-    else:
-        print(f"    ! Could not start frida-server")
-        if not is_rooted:
-            print("    NOTE: This is a Play Store emulator (no root).")
-            print("    Frida spawn mode may still work — attempting anyway...")
+    print(f"    ! frida-server not confirmed — will try anyway (permissive SELinux on emulators usually allows it)")
 
-# ── 4. Start mitmproxy ───────────────────────────────────────────────────────
-print("\n[4] Starting mitmproxy...")
-# Kill existing
+# ── 3. Proxy off, start mitmproxy, proxy on ───────────────────────────────────
+print("\n[3] Starting mitmproxy + setting proxy...")
 subprocess.run(["pkill", "-f", "mitmdump"], capture_output=True)
 time.sleep(1)
-# Clear old traffic log
+
 traffic_log = os.path.join(PROJECT, "metadata", "captured_apis", "api_traffic.jsonl")
 os.makedirs(os.path.dirname(traffic_log), exist_ok=True)
 open(traffic_log, "w").close()
 
 mitm_log = os.path.join(PROJECT, "logs", "mitm.log")
-mitm_proc = subprocess.Popen(
+subprocess.Popen(
     ["mitmdump", "-s", os.path.join(PROJECT, "mitm_addons", "mitm_addon.py"),
-     "--listen-port", "8080", "--ssl-insecure", "--set", "flow_detail=0"],
+     "--listen-port", "8080", "--ssl-insecure"],
     stdout=open(mitm_log, "w"), stderr=subprocess.STDOUT
 )
 time.sleep(3)
-print(f"    ✓ mitmproxy PID {mitm_proc.pid}")
 
-# ── 5. Set device proxy ───────────────────────────────────────────────────────
-print("\n[5] Setting device proxy...")
 try:
     s = socket.socket(); s.settimeout(3); s.connect(("8.8.8.8", 80))
     host_ip = s.getsockname()[0]; s.close()
 except Exception:
     host_ip = "10.0.2.2"
-adb("shell", "settings", "put", "global", "http_proxy", f"{host_ip}:8080")
-print(f"    ✓ Proxy set to {host_ip}:8080")
 
-# ── 6. Launch KukuTV + inject Frida bypass ────────────────────────────────────
-print(f"\n[6] Launching {PACKAGE} with Frida SSL bypass...")
+adb("shell", "settings", "put", "global", "http_proxy", f"{host_ip}:8080", serial=serial)
+print(f"    ✓ mitmproxy running, proxy → {host_ip}:8080")
 
-# Read JS bypass script
+# ── 4. Wait for KukuTV to be open ─────────────────────────────────────────────
+print(f"\n[4] Open KukuTV on the emulator NOW (don't use Frida spawn — open it manually)")
+print(f"    Waiting for the app to start...")
+pid = wait_for_process(serial)
+
+if not pid:
+    print("  KukuTV not detected. Trying to launch it...")
+    sh(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1 2>/dev/null", serial=serial)
+    time.sleep(5)
+    pid = wait_for_process(serial, timeout=60)
+
+if not pid:
+    print("ERROR: KukuTV process not found. Open it manually and re-run.")
+    sys.exit(1)
+
+# ── 5. Attach Frida bypass to running process ─────────────────────────────────
+print(f"\n[5] Attaching Frida SSL bypass to PID {pid}...")
+
 js_path = os.path.join(PROJECT, "mitm_addons", "frida_ssl_bypass.js")
 if not os.path.isfile(js_path):
-    # Use universal SSL bypass script
     js_path = "/tmp/ssl_bypass.js"
-    ssl_bypass_js = r"""
+    open(js_path, "w").write("""
 Java.perform(function() {
-    // Disable TrustManager
     try {
         var TrustManagerImpl = Java.use('com.android.org.conscrypt.TrustManagerImpl');
-        TrustManagerImpl.verifyChain.implementation = function(untrustedChain, trustAnchorChain, host, clientAuth, ocspData, tlsSctData) {
-            return untrustedChain;
-        };
+        TrustManagerImpl.verifyChain.implementation = function(a,b,c,d,e,f) { return a; };
     } catch(e) {}
-
-    // Bypass OkHttp CertificatePinner
     try {
         var CertificatePinner = Java.use('okhttp3.CertificatePinner');
-        CertificatePinner.check.overload('java.lang.String', 'java.util.List').implementation = function() {};
-        CertificatePinner.check.overload('java.lang.String', 'java.security.cert.Certificate[]').implementation = function() {};
+        CertificatePinner.check.overload('java.lang.String','java.util.List').implementation = function() {};
+        CertificatePinner.check.overload('java.lang.String','java.security.cert.Certificate[]').implementation = function() {};
     } catch(e) {}
-
-    // Bypass X509TrustManager
-    try {
-        var X509TrustManager = Java.use('javax.net.ssl.X509TrustManager');
-        var SSLContext = Java.use('javax.net.ssl.SSLContext');
-        var TrustManager = Java.registerClass({
-            name: 'com.custom.TrustManager',
-            implements: [X509TrustManager],
-            methods: {
-                checkClientTrusted: function(chain, authType) {},
-                checkServerTrusted: function(chain, authType) {},
-                getAcceptedIssuers: function() { return []; }
-            }
-        });
-        var TrustManagers = [TrustManager.$new()];
-        var SSLContextObj = SSLContext.getInstance('TLS');
-        SSLContextObj.init(null, TrustManagers, null);
-        var defaultSSLContext = SSLContext.getDefault;
-        SSLContext.getDefault.implementation = function() { return SSLContextObj; };
-    } catch(e) {}
-
-    // Bypass HttpsURLConnection
-    try {
-        var HttpsURLConnection = Java.use('javax.net.ssl.HttpsURLConnection');
-        HttpsURLConnection.setDefaultHostnameVerifier.implementation = function(verifier) {};
-        HttpsURLConnection.setSSLSocketFactory.implementation = function(factory) {};
-        HttpsURLConnection.setHostnameVerifier.implementation = function(verifier) {};
-    } catch(e) {}
-
-    // Disable network security config checks
     try {
         var NetworkSecurityTrustManager = Java.use('android.security.net.config.NetworkSecurityTrustManager');
         NetworkSecurityTrustManager.checkServerTrusted.implementation = function() {};
     } catch(e) {}
-
-    console.log('[+] SSL bypass injected successfully');
+    try {
+        var TrustManagerImpl2 = Java.use('com.android.org.conscrypt.TrustManagerImpl');
+        TrustManagerImpl2.checkTrusted.implementation = function() { return []; };
+    } catch(e) {}
+    console.log('[+] SSL bypass injected!');
 });
-"""
-    open(js_path, "w").write(ssl_bypass_js)
+""")
 
-print(f"    Using bypass script: {js_path}")
-
-# Frida 17: use -f (spawn) without --no-pause; it auto-resumes after script loads
-frida_cmd = ["frida", "-U", "-f", PACKAGE, "-l", js_path]
-print(f"    Running: {' '.join(frida_cmd)}")
-print("\n" + "="*60)
-print("  KukuTV is launching with SSL bypass active.")
-print("  Browse the app: home screen → pick a show → play a video")
-print("  Press Ctrl+C when done browsing to stop capture.")
-print("="*60 + "\n")
+# Attach to running process (not spawn)
+frida_cmd = [
+    "frida",
+    "-U",                    # USB/emulator
+    "-s", serial,            # specific device
+    "-p", pid,               # attach to PID
+    "-l", js_path,           # inject script
+]
+print(f"    {' '.join(frida_cmd)}")
+print("""
+============================================================
+  Frida attached! SSL bypass is active.
+  Browse KukuTV: home → show → play video → back → more shows
+  Press Ctrl+C when done (2-3 minutes of browsing is enough)
+============================================================
+""")
 
 try:
     subprocess.run(frida_cmd)
 except KeyboardInterrupt:
-    pass
+    print("\nStopping...")
 
-# ── 7. Show results ───────────────────────────────────────────────────────────
-print("\n\n=== Capture Results ===")
-count = 0
-kuku = 0
-if os.path.isfile(traffic_log):
-    with open(traffic_log) as f:
-        lines = f.readlines()
-    count = len(lines)
-    kuku = sum(1 for l in lines if '"is_kukutv": true' in l)
-print(f"Total requests: {count}")
-print(f"KukuTV requests: {kuku}")
+# ── 6. Results ────────────────────────────────────────────────────────────────
+adb("shell", "settings", "put", "global", "http_proxy", ":0", serial=serial)
+adb("shell", "settings", "delete", "global", "http_proxy", serial=serial)
 
-if kuku > 0:
-    print("\n✓ KukuTV API traffic captured! Now run:")
-    print("  ./run.sh analyze")
-    print("  ./run.sh scrape")
+lines = open(traffic_log).readlines() if os.path.isfile(traffic_log) else []
+kuku  = [l for l in lines if '"is_kukutv": true' in l]
+print(f"\n=== Results ===")
+print(f"Total captured : {len(lines)}")
+print(f"KukuTV API hits: {len(kuku)}")
+if kuku:
+    print("\n✓ Success! Run:\n  ./run.sh analyze\n  ./run.sh scrape")
 else:
-    print("\nNo KukuTV traffic captured yet.")
-    print("Make sure you browsed the app while Frida was running.")
-
-# Clear proxy
-adb("shell", "settings", "put", "global", "http_proxy", ":0")
-adb("shell", "settings", "delete", "global", "http_proxy")
-print("\nProxy cleared.")
+    print("\nNo KukuTV traffic. Check logs/mitm.log for errors.")
