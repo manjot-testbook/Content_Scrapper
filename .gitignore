@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.idea/
+videos/
+logs/
+metadata/captured_apis/
+metadata/api_catalog/
+metadata/content/
+metadata/page_sources/
+*.apkm
+.DS_Store
