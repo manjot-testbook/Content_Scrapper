@@ -62,25 +62,35 @@ print("    ✓ Pushed and made executable")
 print("\n[3] Starting frida-server on device...")
 sh("pkill -f frida-server 2>/dev/null; true")
 time.sleep(1)
-# Start in background
-subprocess.Popen(
-    [ADB, "shell", f"{FRIDA_SERVER_DEVICE_PATH} &"],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-)
-time.sleep(3)
+
+# Try adb root first (works on google_apis), fall back to shell user (works for spawn on emulators)
+root_out, _, _ = adb("root")
+time.sleep(2)
+is_rooted = "cannot run as root" not in root_out
+
+# Start frida-server in background - use su if available, otherwise shell
+start_cmd = f"nohup {FRIDA_SERVER_DEVICE_PATH} >/dev/null 2>&1 &"
+adb("shell", start_cmd)
+time.sleep(4)
 
 # Verify it's running
-out = sh("ps aux 2>/dev/null | grep frida-server | grep -v grep")
-if not out:
-    # Try with adb shell nohup
-    sh(f"nohup {FRIDA_SERVER_DEVICE_PATH} > /dev/null 2>&1 &")
-    time.sleep(3)
-    out = sh("ps aux 2>/dev/null | grep frida-server | grep -v grep")
-
+out = sh("ps -A 2>/dev/null | grep frida-server | grep -v grep | head -1")
 if out:
-    print(f"    ✓ frida-server running: {out[:80]}")
+    print(f"    ✓ frida-server running (rooted: {is_rooted})")
 else:
-    print("    ! frida-server may not be running — continuing anyway")
+    print(f"    ! frida-server didn't start — trying alternate method...")
+    # Try running directly (blocking start, then we detach)
+    p = subprocess.Popen([ADB, "shell", FRIDA_SERVER_DEVICE_PATH],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(4)
+    out = sh("ps -A 2>/dev/null | grep frida-server | grep -v grep | head -1")
+    if out:
+        print(f"    ✓ frida-server running")
+    else:
+        print(f"    ! Could not start frida-server")
+        if not is_rooted:
+            print("    NOTE: This is a Play Store emulator (no root).")
+            print("    Frida spawn mode may still work — attempting anyway...")
 
 # ── 4. Start mitmproxy ───────────────────────────────────────────────────────
 print("\n[4] Starting mitmproxy...")
@@ -177,8 +187,8 @@ Java.perform(function() {
 
 print(f"    Using bypass script: {js_path}")
 
-# Spawn with Frida
-frida_cmd = ["frida", "-U", "-f", PACKAGE, "-l", js_path, "--no-pause"]
+# Frida 17: use -f (spawn) without --no-pause; it auto-resumes after script loads
+frida_cmd = ["frida", "-U", "-f", PACKAGE, "-l", js_path]
 print(f"    Running: {' '.join(frida_cmd)}")
 print("\n" + "="*60)
 print("  KukuTV is launching with SSL bypass active.")
