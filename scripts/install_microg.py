@@ -2,8 +2,9 @@
 """
 install_microg.py — Install MicroG on KukuTV_Root emulator.
 
-Strategy: mount tmpfs over GMS system app dirs to hide them (root-only, no remount),
-clear package DB, install MicroG.
+Key insight: after mounting tmpfs over GMS dirs, restart the Android framework
+(stop/start) so package manager rescans and loses the GMS signature from memory.
+Then install MicroG BEFORE rebooting (rebooting clears tmpfs mounts).
 
 Run: python scripts/install_microg.py
 """
@@ -15,35 +16,44 @@ def adb(*args):
     r = subprocess.run([ADB] + list(args), capture_output=True, text=True)
     return r.stdout.strip(), r.stderr.strip(), r.returncode
 
-def shell(cmd):
-    out, err, code = adb("shell", cmd)
-    return (out + err).strip(), code
+def sh(cmd):
+    out, err, _ = adb("shell", cmd)
+    return (out + err).strip()
 
 def wait_boot():
     print("  Waiting for boot", end="", flush=True)
-    for _ in range(40):
+    for _ in range(48):
         out, _, _ = adb("shell", "getprop sys.boot_completed")
         if out.strip() == "1": print(" ✓"); return
         time.sleep(5); print(".", end="", flush=True)
-    print(" (continuing)")
+    print(" (timed out — continuing)")
 
-def get_microg_urls():
+def download(url, dest):
+    name = url.split("/")[-1]
+    print(f"  Downloading {name} ...", end="", flush=True)
+    try:
+        urllib.request.urlretrieve(url, dest)
+        print(f" {os.path.getsize(dest)//1024}KB ✓"); return True
+    except Exception as e:
+        print(f" FAILED: {e}"); return False
+
+def get_urls():
     try:
         req = urllib.request.Request(
             "https://api.github.com/repos/microg/GmsCore/releases/latest",
             headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
         urls = {}
         for a in data.get("assets", []):
             n, u = a["name"], a["browser_download_url"]
             if "com.google.android.gms" in n and n.endswith(".apk"): urls["GmsCore"] = u
             elif "com.android.vending" in n and n.endswith(".apk"):  urls["FakeStore"] = u
         if urls:
-            print(f"  MicroG release: {data.get('tag_name')}")
+            print(f"  Latest MicroG: {data.get('tag_name')}")
             return urls
     except Exception as e:
-        print(f"  GitHub API error: {e}")
+        print(f"  GitHub API failed ({e}), using fallback...")
     tag = "v0.3.15.250932"
     base = f"https://github.com/microg/GmsCore/releases/download/{tag}"
     return {
@@ -51,137 +61,140 @@ def get_microg_urls():
         "FakeStore": f"{base}/com.android.vending-84022630.apk",
     }
 
-def download(url, dest):
-    print(f"  Downloading {url.split('/')[-1]} ...", end="", flush=True)
-    try:
-        urllib.request.urlretrieve(url, dest)
-        print(f" {os.path.getsize(dest)//1024}KB ✓"); return True
-    except Exception as e:
-        print(f" FAILED: {e}"); return False
+print("\n=== MicroG Installer (clean rewrite) ===\n")
 
-# ── Check device ──────────────────────────────────────────────────────────────
-print("\n=== MicroG Installer ===\n")
+# 0. Check device + root
+print("[0] Checking device and enabling root...")
 out, _, _ = adb("devices")
 if "emulator" not in out:
     print("ERROR: No emulator connected."); sys.exit(1)
-
-# ── Step 0: Root ──────────────────────────────────────────────────────────────
-print("[0] Enabling root...")
 out, err, _ = adb("root")
 print(f"  {out or err}")
-time.sleep(4)
 if "cannot run as root" in (out + err):
-    print("ERROR: Need KukuTV_Root (google_apis) emulator, not Play Store emulator.")
-    sys.exit(1)
+    print("ERROR: Need KukuTV_Root (google_apis) emulator."); sys.exit(1)
+time.sleep(4)
 
-# ── Step 1: Find GMS system app directories ───────────────────────────────────
-print("\n[1] Finding GMS system app directories...")
-GMS_PACKAGES = {
-    "com.google.android.gms": None,
-    "com.android.vending":    None,
-}
-for pkg in list(GMS_PACKAGES.keys()):
-    out, _, code = adb("shell", f"pm path {pkg}")
+# 1. Find GMS APK dirs
+print("\n[1] Finding GMS dirs...")
+gms_dirs = {}
+for pkg in ["com.google.android.gms", "com.android.vending"]:
+    out, _, _ = adb("shell", f"pm path {pkg}")
     for line in out.splitlines():
         if "package:" in line:
-            apk = line.split("package:")[-1].strip()
-            pkg_dir = os.path.dirname(apk)
-            GMS_PACKAGES[pkg] = pkg_dir
-            print(f"  {pkg} → {pkg_dir}")
+            apk_path = line.split("package:")[-1].strip()
+            d = os.path.dirname(apk_path)
+            gms_dirs[pkg] = d
+            print(f"  {pkg} → {d}")
             break
-    if not GMS_PACKAGES[pkg]:
-        print(f"  {pkg} → not found (already removed?)")
-
-# ── Step 2: Hide GMS dirs using tmpfs mount (no remount needed) ───────────────
-print("\n[2] Hiding GMS dirs with tmpfs mounts (root trick, no /system remount)...")
-for pkg, pkg_dir in GMS_PACKAGES.items():
-    if not pkg_dir:
-        continue
-    print(f"  Mounting tmpfs over {pkg_dir} ...")
-    out, code = shell(f"mount -t tmpfs tmpfs {pkg_dir}")
-    if code == 0 or out == "":
-        print(f"  ✓ Hidden: {pkg_dir}")
     else:
-        print(f"  ! Warning: {out}")
+        print(f"  {pkg} → not found")
 
-# ── Step 3: Clear package DB entries ──────────────────────────────────────────
-print("\n[3] Clearing GMS from package manager database...")
-for pkg in GMS_PACKAGES:
-    out, code = shell(f"pm uninstall --user 0 {pkg} 2>/dev/null; echo done")
-    print(f"  {pkg}: cleared")
+if not gms_dirs:
+    print("  GMS not found at all — proceeding to install MicroG directly.")
 
-# Force package manager to re-scan (stop → it restarts automatically)
-shell("am force-stop com.google.android.gms 2>/dev/null")
-shell("am force-stop com.android.vending 2>/dev/null")
-time.sleep(3)
+# 2. Mount tmpfs over GMS dirs to hide them
+print("\n[2] Hiding GMS with tmpfs mounts...")
+for pkg, d in gms_dirs.items():
+    result = sh(f"mount -t tmpfs tmpfs '{d}' && echo OK")
+    if "OK" in result or result == "":
+        print(f"  ✓ Masked: {d}")
+    else:
+        print(f"  ! {d}: {result}")
 
-# ── Step 4: Download MicroG ───────────────────────────────────────────────────
+# 3. Restart Android framework so package manager rescans (loses GMS signature)
+print("\n[3] Restarting Android framework (package manager will rescan without GMS)...")
+print("  Stopping framework...", end="", flush=True)
+sh("stop")
+time.sleep(6)
+print(" done")
+print("  Starting framework...", end="", flush=True)
+sh("start")
+# Wait for package manager to be ready
+for _ in range(30):
+    time.sleep(3)
+    out = sh("pm list packages 2>/dev/null | head -1")
+    if "package:" in out:
+        print(" ready ✓")
+        break
+    print(".", end="", flush=True)
+else:
+    print(" (continuing anyway)")
+time.sleep(5)
+
+# 4. Download + install MicroG
 print("\n[4] Downloading MicroG APKs...")
-urls = get_microg_urls()
-apk_files = []
+urls = get_urls()
 with tempfile.TemporaryDirectory() as tmp:
+    apks = []
     for label, url in urls.items():
         dest = os.path.join(tmp, url.split("/")[-1])
         if download(url, dest):
-            apk_files.append((dest, label))
+            apks.append((dest, label))
 
-    if not apk_files:
+    if not apks:
         print("ERROR: No APKs downloaded."); sys.exit(1)
 
-    # ── Step 5: Install MicroG ────────────────────────────────────────────────
     print("\n[5] Installing MicroG...")
-    all_ok = True
-    for apk, label in apk_files:
+    for apk, label in apks:
         print(f"  Installing {label} ...")
         out, err, code = adb("install", "-r", "-d", apk)
-        if code == 0 or "Success" in out:
+        combined = (out + err)
+        if code == 0 or "Success" in combined:
             print(f"  ✓ {label}")
         else:
-            print(f"  ✗ {label}: {(err or out)[:300]}")
-            all_ok = False
+            print(f"  ✗ {label}: {combined[:200]}")
 
-    if not all_ok:
-        # Try pushing directly to /system/priv-app as a last resort
-        print("\n  Trying direct push to /system/priv-app via tmpfs overlay...")
-        out2, code2 = shell("mount -t tmpfs tmpfs /system/priv-app 2>/dev/null && echo ok")
-        if "ok" in out2 or code2 == 0:
-            for apk, label in apk_files:
-                pkg = "com.google.android.gms" if "gms" in apk else "com.android.vending"
-                dir_name = pkg
-                shell(f"mkdir -p /system/priv-app/{dir_name}")
-                adb("push", apk, f"/system/priv-app/{dir_name}/{os.path.basename(apk)}")
-                shell(f"chmod 644 /system/priv-app/{dir_name}/*.apk")
-                print(f"  Pushed {label} to /system/priv-app/{dir_name}/")
-            shell("pm scan /system/priv-app")
-
-# ── Step 6: Grant permissions ─────────────────────────────────────────────────
-print("\n[6] Granting MicroG permissions...")
-for p in ["android.permission.READ_PHONE_STATE", "android.permission.RECEIVE_SMS",
-          "android.permission.READ_SMS", "android.permission.ACCESS_COARSE_LOCATION",
-          "android.permission.ACCESS_FINE_LOCATION", "android.permission.GET_ACCOUNTS"]:
+# 5. Grant permissions
+print("\n[6] Granting permissions to MicroG...")
+for p in [
+    "android.permission.READ_PHONE_STATE",
+    "android.permission.RECEIVE_SMS",
+    "android.permission.READ_SMS",
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.GET_ACCOUNTS",
+]:
     adb("shell", "pm", "grant", "com.google.android.gms", p)
-print("  ✓ Done")
+print("  ✓ Permissions granted")
 
-# ── Step 7: Enable signature spoofing ─────────────────────────────────────────
-print("\n[7] Enabling signature spoofing...")
-shell("settings put global development_settings_enabled 1")
-shell("device_config set runtime_native core.allow_gms_signature_faking true 2>/dev/null")
+# 6. Verify MicroG installed
+print("\n[7] Verifying installation...")
+out = sh("pm list packages | grep google.android.gms")
+if "com.google.android.gms" in out:
+    print(f"  ✓ MicroG installed: {out}")
+else:
+    print(f"  ✗ Not found — install likely failed due to lingering signature.")
+    print("    Try running: python scripts/install_microg.py  again after reboot.")
 
-# ── Step 8: Reboot ────────────────────────────────────────────────────────────
-print("\n[8] Rebooting...")
-adb("reboot"); time.sleep(15)
+# 7. Reboot to make MicroG permanent
+print("\n[8] Rebooting to make installation permanent...")
+adb("reboot")
+time.sleep(15)
 wait_boot()
+
+# After reboot, GMS dirs are visible again. MicroG is now in /data/app.
+# Check if MicroG survived
+out = sh("pm list packages | grep google.android.gms")
+print(f"\n  Post-reboot GMS package: {out}")
+if "com.google.android.gms" in out:
+    print("  ✓ MicroG survived reboot!")
+else:
+    print("  ✗ MicroG gone after reboot (system GMS took precedence).")
+    print("  The KukuTV_Root image has GMS baked in and protected.")
+    print("  Switching to Frida-based SSL bypass instead (no MicroG needed).")
+    print("  Run: python scripts/bypass_ssl_pinning.py")
 
 print("""
 ============================================================
-  Setup complete. Now:
-  1. Open MicroG Settings app on emulator → enable all toggles
-     (especially "Google device registration" and "Cloud Messaging")
-  2. Open KukuTV — Play Services prompt should be gone
-  3. Log in with phone + OTP  (proxy is OFF)
-  4. After login run:
+  Done. Next steps:
+  1. Open KukuTV on the emulator
+     - If it asks for Play Services: open 'MicroG Settings' → enable all
+  2. Log in with phone + OTP
+     (proxy is OFF — OTP will work)
+  3. After login:
        python scripts/fix_cert.py
        python scripts/login_mode.py on
-  5. Browse KukuTV → ./run.sh analyze
+  4. Browse KukuTV, then:
+       ./run.sh analyze
 ============================================================
 """)
