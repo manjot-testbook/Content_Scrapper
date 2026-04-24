@@ -6,6 +6,7 @@ This script unzips them and uses `adb install-multiple` to install.
 """
 
 import argparse
+import glob
 import os
 import subprocess
 import sys
@@ -16,21 +17,37 @@ from rich.console import Console
 
 console = Console()
 
+SDK_ROOT = os.path.expanduser("~/Library/Android/sdk")
+
 
 def find_adb() -> str:
     """Locate adb binary."""
+    candidates = [
+        os.path.join(SDK_ROOT, "platform-tools", "adb"),
+        "/usr/local/bin/adb",
+    ]
     result = subprocess.run(["which", "adb"], capture_output=True, text=True)
     if result.returncode == 0:
         return result.stdout.strip()
-    # Try common paths
-    for path in [
-        os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
-        "/usr/local/bin/adb",
-    ]:
+    for path in candidates:
         if os.path.isfile(path):
             return path
     console.print("[red]adb not found. Install Android SDK platform-tools.[/red]")
     sys.exit(1)
+
+
+def find_aapt2() -> str | None:
+    """Locate aapt2 — checks $PATH first, then Android SDK build-tools."""
+    result = subprocess.run(["which", "aapt2"], capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout.strip()
+    # Search build-tools (newest version first)
+    pattern = os.path.join(SDK_ROOT, "build-tools", "*", "aapt2")
+    matches = sorted(glob.glob(pattern), reverse=True)
+    if matches:
+        console.print(f"[dim]Found aapt2: {matches[0]}[/dim]")
+        return matches[0]
+    return None
 
 
 def check_device(adb: str) -> str:
@@ -81,7 +98,12 @@ def get_package_name(apkm_path: str) -> str | None:
     if parts and parts[0].count(".") >= 2:
         return parts[0]
 
-    # Try aapt2 if available
+    # Try aapt2 (located via find_aapt2)
+    aapt2 = find_aapt2()
+    if not aapt2:
+        console.print("[dim]aapt2 not found — skipping package name detection[/dim]")
+        return None
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             with zipfile.ZipFile(apkm_path, "r") as zf:
@@ -90,7 +112,7 @@ def get_package_name(apkm_path: str) -> str | None:
                         zf.extract(name, tmp)
                         apk_path = os.path.join(tmp, name)
                         result = subprocess.run(
-                            ["aapt2", "dump", "badging", apk_path],
+                            [aapt2, "dump", "badging", apk_path],
                             capture_output=True, text=True,
                         )
                         if result.returncode == 0:
@@ -99,8 +121,8 @@ def get_package_name(apkm_path: str) -> str | None:
                                     p = line.split("name='")
                                     if len(p) > 1:
                                         return p[1].split("'")[0]
-    except FileNotFoundError:
-        console.print("[dim]aapt2 not found, skipping detailed package detection[/dim]")
+    except Exception as e:
+        console.print(f"[dim]aapt2 error: {e}[/dim]")
     return None
 
 

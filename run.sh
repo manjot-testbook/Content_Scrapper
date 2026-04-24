@@ -3,16 +3,17 @@
 # KukuTV Content Scraper — Master Run Script
 # =============================================================================
 # Usage:
-#   ./run.sh emulator  → start Android emulator (KukuTV_Root AVD)
+#   ./run.sh emulator  → start Android emulator (Play Store AVD preferred)
+#   ./run.sh install   → sideload KukuTV APKM onto connected emulator
 #   ./run.sh capture   → start proxy + navigate app + capture APIs
 #   ./run.sh analyze   → analyze captured traffic
 #   ./run.sh scrape    → download videos from discovered URLs
 #   ./run.sh all       → capture + analyze + scrape
 #   ./run.sh proxy     → start proxy only (background)
 #   ./run.sh navigate  → run Appium navigator only
-#   ./run.sh status    → print current state
 #   ./run.sh bypass    → Frida SSL pinning bypass
 #   ./run.sh stop      → stop proxy + clear device proxy
+#   ./run.sh status    → print current state
 # =============================================================================
 
 set -e
@@ -48,17 +49,37 @@ check_deps() {
 }
 
 EMULATOR="$HOME/Library/Android/sdk/emulator/emulator"
-PREFERRED_AVD="${KUKUTV_AVD:-KukuTV_Root}"
+PREFERRED_AVD="${KUKUTV_AVD:-Medium_Phone_API_36.1}"
 
 start_emulator() {
-    # Pick AVD: prefer KukuTV_Root, fall back to first available
+    # Pick AVD: prefer the configured one, then any Play Store AVD, then first available
     local avd="$PREFERRED_AVD"
-    if ! "$EMULATOR" -list-avds 2>/dev/null | grep -q "^${avd}$"; then
-        avd=$("$EMULATOR" -list-avds 2>/dev/null | head -1)
+    local all_avds
+    all_avds=$("$EMULATOR" -list-avds 2>/dev/null)
+
+    if ! echo "$all_avds" | grep -q "^${avd}$"; then
+        # Try to find a Play Store AVD
+        avd=$(echo "$all_avds" | while read -r a; do
+            cfg="$HOME/.android/avd/${a}.avd/config.ini"
+            if grep -q 'playstore' "$cfg" 2>/dev/null; then echo "$a"; break; fi
+        done | head -1)
+        # Fall back to first AVD
+        [ -z "$avd" ] && avd=$(echo "$all_avds" | head -1)
     fi
+
     if [ -z "$avd" ]; then
-        err "No AVDs found. Create one in Android Studio (AVD Manager)."
+        err "No AVDs found. Create one in Android Studio with Google Play Store enabled."
         return 1
+    fi
+
+    # Warn if selected AVD lacks Play Store
+    cfg="$HOME/.android/avd/${avd}.avd/config.ini"
+    if ! grep -q 'playstore' "$cfg" 2>/dev/null; then
+        warn "AVD '$avd' does NOT have Google Play Store."
+        warn "KukuTV requires Google Play Services. Use 'Google Play' system image in AVD Manager."
+        warn "Continuing anyway — you can sideload via: ./run.sh install"
+    else
+        ok "AVD '$avd' has Google Play Store ✓"
     fi
 
     log "Starting emulator AVD: $avd ..."
@@ -171,6 +192,17 @@ stop_proxy() {
 
 # ── commands ──────────────────────────────────────────────────────────────────
 
+cmd_install() {
+    local apkm
+    apkm=$(ls "$PROJECT"/apkm/*.apkm 2>/dev/null | head -1)
+    if [ -z "$apkm" ]; then
+        err "No .apkm file found in apkm/ directory."
+        return 1
+    fi
+    log "Installing: $apkm"
+    "$PYTHON" "$PROJECT/scripts/install_apkm.py" --apkm "$apkm" "$@"
+}
+
 cmd_emulator() {
     mkdir -p "$PROJECT/logs"
     start_emulator
@@ -259,6 +291,7 @@ shift 2>/dev/null || true
 case "$CMD" in
     status)   cmd_status ;;
     emulator) cmd_emulator ;;
+    install)  cmd_install "$@" ;;
     proxy)    cmd_proxy ;;
     stop)     cmd_stop ;;
     navigate) cmd_navigate "$@" ;;
@@ -268,7 +301,7 @@ case "$CMD" in
     capture)  cmd_capture ;;
     all)      cmd_all ;;
     *)
-        echo "Usage: ./run.sh [status|emulator|proxy|stop|navigate|analyze|scrape|bypass|capture|all]"
+        echo "Usage: ./run.sh [status|emulator|install|proxy|stop|navigate|analyze|scrape|bypass|capture|all]"
         exit 1
         ;;
 esac
