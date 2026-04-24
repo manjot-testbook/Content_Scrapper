@@ -61,6 +61,19 @@ def download(url, dest):
         print(f" FAILED: {e}")
         return False
 
+# Check device
+out, _, _ = adb("devices")
+if "emulator" not in out and len(out.split("\n")) < 2:
+    print("ERROR: No emulator connected.")
+    sys.exit(1)
+
+# Enable root + remount
+print("[0] Enabling root + remount...")
+adb("root"); time.sleep(4)
+out, _, _ = adb("remount")
+print(f"  remount: {out}")
+time.sleep(2)
+
 def install(apk, label):
     print(f"  Installing {label} ...")
     out, err, code = adb("install", "-r", "-d", apk)
@@ -76,34 +89,48 @@ def install(apk, label):
     return False
 
 def uninstall_system_app(package):
-    """Remove system app updates and disable so MicroG can replace it."""
-    print(f"  Uninstalling system {package} ...")
-    # Remove user-installed updates first
+    """Physically delete system app from /system so MicroG can replace it."""
+    print(f"  Removing system {package} ...")
+    # Disable updates first
     adb("shell", "pm", "uninstall", "-k", "--user", "0", package)
-    # If still present as system app, delete the APK via root
+    # Find all APK paths (may be in /system/app, /system/priv-app, /data/app)
     out, _, _ = adb("shell", f"pm path {package}")
+    deleted = False
     for line in out.splitlines():
-        if "package:" in line:
-            path = line.split("package:")[-1].strip()
-            # Only delete if it's in /system or /data/app
-            if path:
-                adb("shell", f"rm -f {path}")
-                # Also remove base dir
-                adb("shell", f"rm -rf {os.path.dirname(path)}")
-    print(f"  ✓ Removed {package}")
+        if "package:" not in line:
+            continue
+        apk_path = line.split("package:")[-1].strip()
+        pkg_dir  = os.path.dirname(apk_path)
+        print(f"    Deleting {pkg_dir} ...")
+        adb("shell", f"rm -rf {pkg_dir}")
+        deleted = True
+    # Also brute-force search common locations
+    for loc in ["/system/priv-app", "/system/app"]:
+        out2, _, _ = adb("shell", f"ls {loc}")
+        for d in out2.splitlines():
+            if package.split(".")[-1].lower() in d.lower() or "vending" in d.lower() and "vending" in package:
+                full = f"{loc}/{d.strip()}"
+                print(f"    Deleting {full} ...")
+                adb("shell", f"rm -rf {full}")
+                deleted = True
+    if deleted:
+        print(f"  ✓ Removed {package}")
+    else:
+        print(f"  ! {package} not found (may already be absent)")
 
-# Check device
-out, _, _ = adb("devices")
-if "emulator" not in out and len(out.split("\n")) < 2:
-    print("ERROR: No emulator connected.")
-    sys.exit(1)
-
-# Enable root (needed on KukuTV_Root)
-print("[0] Enabling root + remount...")
-adb("root")
-time.sleep(4)
-adb("remount")
-time.sleep(2)
+def install(apk, label):
+    print(f"  Installing {label} ...")
+    # -t allows test packages, -d allows downgrade, -r replaces existing
+    for flags in [
+        ["install", "-r", "-d", "-t", apk],
+        ["install", "-r", "-d", apk],
+    ]:
+        out, err, code = adb(*flags)
+        if code == 0 or "Success" in out:
+            print(f"  ✓ {label} installed")
+            return True
+    print(f"  ✗ Failed: {(err or out)[:200]}")
+    return False
 
 print("\n[1] Removing existing Google Play Services / Play Store (system apps)...")
 for pkg in ["com.google.android.gms", "com.android.vending"]:
@@ -117,7 +144,21 @@ for _ in range(30):
     out, _, _ = adb("shell", "getprop sys.boot_completed")
     if out.strip() == "1": print(" ✓"); break
     time.sleep(5); print(".", end="", flush=True)
+
+# Re-enable root after reboot and force-delete any remaining system APK dirs
 adb("root"); time.sleep(4)
+adb("remount"); time.sleep(2)
+print("  Force-deleting any remaining system GMS dirs...")
+for loc in ["/system/priv-app", "/system/app"]:
+    out, _, _ = adb("shell", f"ls {loc} 2>/dev/null")
+    for d in out.splitlines():
+        dl = d.strip().lower()
+        if any(k in dl for k in ["gmscore","gms","googleplayservices","vending","fakestore"]):
+            adb("shell", f"rm -rf {loc}/{d.strip()}")
+            print(f"    Deleted: {loc}/{d.strip()}")
+# Also clear package manager database entries
+adb("shell", "rm -f /data/system/packages.xml.bak")
+time.sleep(1)
 
 print("\n[3] Downloading MicroG APKs...")
 if not MICROG_APKS:
