@@ -3,6 +3,7 @@
 # KukuTV Content Scraper — Master Run Script
 # =============================================================================
 # Usage:
+#   ./run.sh emulator  → start Android emulator (KukuTV_Root AVD)
 #   ./run.sh capture   → start proxy + navigate app + capture APIs
 #   ./run.sh analyze   → analyze captured traffic
 #   ./run.sh scrape    → download videos from discovered URLs
@@ -10,6 +11,8 @@
 #   ./run.sh proxy     → start proxy only (background)
 #   ./run.sh navigate  → run Appium navigator only
 #   ./run.sh status    → print current state
+#   ./run.sh bypass    → Frida SSL pinning bypass
+#   ./run.sh stop      → stop proxy + clear device proxy
 # =============================================================================
 
 set -e
@@ -44,17 +47,55 @@ check_deps() {
     return $missing
 }
 
+EMULATOR="$HOME/Library/Android/sdk/emulator/emulator"
+PREFERRED_AVD="${KUKUTV_AVD:-KukuTV_Root}"
+
+start_emulator() {
+    # Pick AVD: prefer KukuTV_Root, fall back to first available
+    local avd="$PREFERRED_AVD"
+    if ! "$EMULATOR" -list-avds 2>/dev/null | grep -q "^${avd}$"; then
+        avd=$("$EMULATOR" -list-avds 2>/dev/null | head -1)
+    fi
+    if [ -z "$avd" ]; then
+        err "No AVDs found. Create one in Android Studio (AVD Manager)."
+        return 1
+    fi
+
+    log "Starting emulator AVD: $avd ..."
+    nohup "$EMULATOR" -avd "$avd" -no-snapshot-save -no-audio \
+        > "$PROJECT/logs/emulator.log" 2>&1 &
+    echo $! > "$PROJECT/logs/emulator.pid"
+
+    log "Waiting for emulator to boot (up to 120s)..."
+    local waited=0
+    while [ $waited -lt 120 ]; do
+        local boot
+        boot=$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+        if [ "$boot" = "1" ]; then
+            ok "Emulator booted ($avd)"
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+        echo -n "."
+    done
+    echo ""
+    warn "Emulator may still be booting — check Android Studio / logs/emulator.log"
+}
+
 check_device() {
     local devices
     devices=$("$ADB" devices 2>/dev/null | grep -v "^List" | grep "device$" | wc -l | tr -d ' ')
     if [ "$devices" -eq 0 ]; then
-        err "No Android device/emulator connected."
-        echo ""
-        echo "  Start Android emulator from Android Studio, then re-run."
-        echo "  Emulator AVD should have:"
-        echo "    • Google Play Store enabled (app installed via Play)"
-        echo "    • API 30+ recommended"
-        return 1
+        warn "No Android device/emulator connected — attempting to start one automatically..."
+        mkdir -p "$PROJECT/logs"
+        start_emulator || return 1
+        # Re-check
+        devices=$("$ADB" devices 2>/dev/null | grep -v "^List" | grep "device$" | wc -l | tr -d ' ')
+        if [ "$devices" -eq 0 ]; then
+            err "Emulator still not detected. Start it manually from Android Studio."
+            return 1
+        fi
     fi
     ok "Device connected ($devices device(s))"
 }
@@ -130,11 +171,18 @@ stop_proxy() {
 
 # ── commands ──────────────────────────────────────────────────────────────────
 
+cmd_emulator() {
+    mkdir -p "$PROJECT/logs"
+    start_emulator
+}
+
 cmd_status() {
     echo ""
     echo "═══════════════════════════════════"
     echo "        KukuTV Scraper Status      "
     echo "═══════════════════════════════════"
+    echo "Available AVDs:"
+    "$EMULATOR" -list-avds 2>/dev/null | sed 's/^/  /' || echo "  (none)"
     "$ADB" devices 2>/dev/null | grep -v "^List" || true
     "$ADB" shell pm list packages 2>/dev/null | grep kuku || echo "  App: not installed"
     lsof -i :8080 -sTCP:LISTEN &>/dev/null && echo "  Proxy: running on :8080" || echo "  Proxy: not running"
@@ -210,6 +258,7 @@ shift 2>/dev/null || true
 
 case "$CMD" in
     status)   cmd_status ;;
+    emulator) cmd_emulator ;;
     proxy)    cmd_proxy ;;
     stop)     cmd_stop ;;
     navigate) cmd_navigate "$@" ;;
@@ -219,7 +268,7 @@ case "$CMD" in
     capture)  cmd_capture ;;
     all)      cmd_all ;;
     *)
-        echo "Usage: ./run.sh [status|proxy|stop|navigate|analyze|scrape|bypass|capture|all]"
+        echo "Usage: ./run.sh [status|emulator|proxy|stop|navigate|analyze|scrape|bypass|capture|all]"
         exit 1
         ;;
 esac
