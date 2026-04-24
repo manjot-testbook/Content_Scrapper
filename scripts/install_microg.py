@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-install_microg.py — Install MicroG (Play Services replacement) on KukuTV_Root emulator.
+install_microg.py — Install MicroG on KukuTV_Root emulator.
 
-Strategy: patch /data/system/packages.xml to remove Google's GMS signature entries,
-then install MicroG. This works WITHOUT needing adb remount or /system write access.
+Strategy: mount tmpfs over GMS system app dirs to hide them (root-only, no remount),
+clear package DB, install MicroG.
 
 Run: python scripts/install_microg.py
 """
-import os, subprocess, sys, urllib.request, tempfile, time, json, re
+import os, subprocess, sys, urllib.request, tempfile, time, json
 
 ADB = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
 
@@ -15,35 +15,35 @@ def adb(*args):
     r = subprocess.run([ADB] + list(args), capture_output=True, text=True)
     return r.stdout.strip(), r.stderr.strip(), r.returncode
 
+def shell(cmd):
+    out, err, code = adb("shell", cmd)
+    return (out + err).strip(), code
+
 def wait_boot():
     print("  Waiting for boot", end="", flush=True)
-    for _ in range(36):
+    for _ in range(40):
         out, _, _ = adb("shell", "getprop sys.boot_completed")
         if out.strip() == "1": print(" ✓"); return
         time.sleep(5); print(".", end="", flush=True)
-    print(" (continuing anyway)")
+    print(" (continuing)")
 
 def get_microg_urls():
-    print("  Fetching latest MicroG release from GitHub...")
     try:
         req = urllib.request.Request(
             "https://api.github.com/repos/microg/GmsCore/releases/latest",
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
+            headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
         urls = {}
-        for asset in data.get("assets", []):
-            name, url = asset["name"], asset["browser_download_url"]
-            if "com.google.android.gms" in name and name.endswith(".apk"):
-                urls["GmsCore"] = url
-            elif "com.android.vending" in name and name.endswith(".apk"):
-                urls["FakeStore"] = url
+        for a in data.get("assets", []):
+            n, u = a["name"], a["browser_download_url"]
+            if "com.google.android.gms" in n and n.endswith(".apk"): urls["GmsCore"] = u
+            elif "com.android.vending" in n and n.endswith(".apk"):  urls["FakeStore"] = u
         if urls:
-            print(f"  Release: {data.get('tag_name')} — {len(urls)} APK(s)")
+            print(f"  MicroG release: {data.get('tag_name')}")
             return urls
     except Exception as e:
-        print(f"  GitHub API failed: {e}")
+        print(f"  GitHub API error: {e}")
     tag = "v0.3.15.250932"
     base = f"https://github.com/microg/GmsCore/releases/download/{tag}"
     return {
@@ -55,24 +55,12 @@ def download(url, dest):
     print(f"  Downloading {url.split('/')[-1]} ...", end="", flush=True)
     try:
         urllib.request.urlretrieve(url, dest)
-        print(f" {os.path.getsize(dest)//1024}KB ✓")
-        return True
+        print(f" {os.path.getsize(dest)//1024}KB ✓"); return True
     except Exception as e:
         print(f" FAILED: {e}"); return False
 
-def remove_pkg_from_xml(xml_text, package):
-    """Remove a <package> entry from packages.xml by package name."""
-    # Match full <package ... name="com.google.android.gms" .../> or multiline block
-    pattern = rf'<package[^>]+name="{re.escape(package)}"[^>]*/>'
-    result, count = re.subn(pattern, '', xml_text)
-    if count == 0:
-        # Try multiline block: <package ...> ... </package>
-        pattern2 = rf'<package[^>]+name="{re.escape(package)}".*?</package>'
-        result, count = re.subn(pattern2, '', xml_text, flags=re.DOTALL)
-    return result, count
-
 # ── Check device ──────────────────────────────────────────────────────────────
-print("\n=== MicroG Installer (packages.xml method) ===\n")
+print("\n=== MicroG Installer ===\n")
 out, _, _ = adb("devices")
 if "emulator" not in out:
     print("ERROR: No emulator connected."); sys.exit(1)
@@ -83,46 +71,52 @@ out, err, _ = adb("root")
 print(f"  {out or err}")
 time.sleep(4)
 if "cannot run as root" in (out + err):
-    print("ERROR: This emulator doesn't support root. Need KukuTV_Root (google_apis) AVD.")
+    print("ERROR: Need KukuTV_Root (google_apis) emulator, not Play Store emulator.")
     sys.exit(1)
 
-# ── Step 1: Patch packages.xml ────────────────────────────────────────────────
-print("\n[1] Patching /data/system/packages.xml to remove GMS signature entries...")
-with tempfile.TemporaryDirectory() as tmp:
-    xml_local = os.path.join(tmp, "packages.xml")
-    xml_bak   = os.path.join(tmp, "packages.xml.bak")
+# ── Step 1: Find GMS system app directories ───────────────────────────────────
+print("\n[1] Finding GMS system app directories...")
+GMS_PACKAGES = {
+    "com.google.android.gms": None,
+    "com.android.vending":    None,
+}
+for pkg in list(GMS_PACKAGES.keys()):
+    out, _, code = adb("shell", f"pm path {pkg}")
+    for line in out.splitlines():
+        if "package:" in line:
+            apk = line.split("package:")[-1].strip()
+            pkg_dir = os.path.dirname(apk)
+            GMS_PACKAGES[pkg] = pkg_dir
+            print(f"  {pkg} → {pkg_dir}")
+            break
+    if not GMS_PACKAGES[pkg]:
+        print(f"  {pkg} → not found (already removed?)")
 
-    # Pull packages.xml
-    out, err, code = adb("pull", "/data/system/packages.xml", xml_local)
-    if code != 0 or not os.path.isfile(xml_local):
-        print(f"  ERROR pulling packages.xml: {err}"); sys.exit(1)
-    print(f"  Pulled packages.xml ({os.path.getsize(xml_local)//1024}KB)")
-
-    with open(xml_local, "r", encoding="utf-8", errors="replace") as f:
-        xml = f.read()
-
-    # Backup
-    import shutil; shutil.copy(xml_local, xml_bak)
-
-    total_removed = 0
-    for pkg in ["com.google.android.gms", "com.android.vending"]:
-        xml, count = remove_pkg_from_xml(xml, pkg)
-        print(f"  Removed {count} entry/entries for {pkg}")
-        total_removed += count
-
-    if total_removed == 0:
-        print("  No entries found — packages may already be clean.")
+# ── Step 2: Hide GMS dirs using tmpfs mount (no remount needed) ───────────────
+print("\n[2] Hiding GMS dirs with tmpfs mounts (root trick, no /system remount)...")
+for pkg, pkg_dir in GMS_PACKAGES.items():
+    if not pkg_dir:
+        continue
+    print(f"  Mounting tmpfs over {pkg_dir} ...")
+    out, code = shell(f"mount -t tmpfs tmpfs {pkg_dir}")
+    if code == 0 or out == "":
+        print(f"  ✓ Hidden: {pkg_dir}")
     else:
-        with open(xml_local, "w", encoding="utf-8") as f:
-            f.write(xml)
-        # Push back
-        adb("push", xml_local, "/data/system/packages.xml")
-        adb("shell", "chmod", "660", "/data/system/packages.xml")
-        adb("shell", "chown", "system:system", "/data/system/packages.xml")
-        print("  ✓ packages.xml updated")
+        print(f"  ! Warning: {out}")
 
-# ── Step 2: Download MicroG ───────────────────────────────────────────────────
-print("\n[2] Downloading MicroG APKs...")
+# ── Step 3: Clear package DB entries ──────────────────────────────────────────
+print("\n[3] Clearing GMS from package manager database...")
+for pkg in GMS_PACKAGES:
+    out, code = shell(f"pm uninstall --user 0 {pkg} 2>/dev/null; echo done")
+    print(f"  {pkg}: cleared")
+
+# Force package manager to re-scan (stop → it restarts automatically)
+shell("am force-stop com.google.android.gms 2>/dev/null")
+shell("am force-stop com.android.vending 2>/dev/null")
+time.sleep(3)
+
+# ── Step 4: Download MicroG ───────────────────────────────────────────────────
+print("\n[4] Downloading MicroG APKs...")
 urls = get_microg_urls()
 apk_files = []
 with tempfile.TemporaryDirectory() as tmp:
@@ -134,53 +128,60 @@ with tempfile.TemporaryDirectory() as tmp:
     if not apk_files:
         print("ERROR: No APKs downloaded."); sys.exit(1)
 
-    # ── Step 3: Reboot so package manager reloads without GMS entries ─────────
-    print("\n[3] Rebooting (package manager will reload without GMS entries)...")
-    adb("reboot")
-    time.sleep(15)
-    wait_boot()
-    adb("root"); time.sleep(3)
-
-    # ── Step 4: Install MicroG ────────────────────────────────────────────────
-    print("\n[4] Installing MicroG APKs...")
+    # ── Step 5: Install MicroG ────────────────────────────────────────────────
+    print("\n[5] Installing MicroG...")
+    all_ok = True
     for apk, label in apk_files:
         print(f"  Installing {label} ...")
         out, err, code = adb("install", "-r", "-d", apk)
         if code == 0 or "Success" in out:
             print(f"  ✓ {label}")
         else:
-            print(f"  ✗ {label}: {(err or out)[:200]}")
+            print(f"  ✗ {label}: {(err or out)[:300]}")
+            all_ok = False
 
-# ── Step 5: Permissions ───────────────────────────────────────────────────────
-print("\n[5] Granting MicroG permissions...")
+    if not all_ok:
+        # Try pushing directly to /system/priv-app as a last resort
+        print("\n  Trying direct push to /system/priv-app via tmpfs overlay...")
+        out2, code2 = shell("mount -t tmpfs tmpfs /system/priv-app 2>/dev/null && echo ok")
+        if "ok" in out2 or code2 == 0:
+            for apk, label in apk_files:
+                pkg = "com.google.android.gms" if "gms" in apk else "com.android.vending"
+                dir_name = pkg
+                shell(f"mkdir -p /system/priv-app/{dir_name}")
+                adb("push", apk, f"/system/priv-app/{dir_name}/{os.path.basename(apk)}")
+                shell(f"chmod 644 /system/priv-app/{dir_name}/*.apk")
+                print(f"  Pushed {label} to /system/priv-app/{dir_name}/")
+            shell("pm scan /system/priv-app")
+
+# ── Step 6: Grant permissions ─────────────────────────────────────────────────
+print("\n[6] Granting MicroG permissions...")
 for p in ["android.permission.READ_PHONE_STATE", "android.permission.RECEIVE_SMS",
-          "android.permission.READ_SMS", "android.permission.ACCESS_COARSE_LOCATION"]:
+          "android.permission.READ_SMS", "android.permission.ACCESS_COARSE_LOCATION",
+          "android.permission.ACCESS_FINE_LOCATION", "android.permission.GET_ACCOUNTS"]:
     adb("shell", "pm", "grant", "com.google.android.gms", p)
 print("  ✓ Done")
 
-# ── Step 6: Enable signature spoofing (required for MicroG to work) ───────────
-print("\n[6] Enabling signature spoofing via device_config...")
-adb("shell", "device_config", "set", "runtime_native", "core.allow_gms_signature_faking", "true")
-adb("shell", "settings", "put", "global", "development_settings_enabled", "1")
+# ── Step 7: Enable signature spoofing ─────────────────────────────────────────
+print("\n[7] Enabling signature spoofing...")
+shell("settings put global development_settings_enabled 1")
+shell("device_config set runtime_native core.allow_gms_signature_faking true 2>/dev/null")
 
-# ── Step 7: Final reboot ──────────────────────────────────────────────────────
-print("\n[7] Final reboot...")
-adb("reboot")
-time.sleep(15)
+# ── Step 8: Reboot ────────────────────────────────────────────────────────────
+print("\n[8] Rebooting...")
+adb("reboot"); time.sleep(15)
 wait_boot()
 
 print("""
 ============================================================
-  ✓ MicroG setup complete
-============================================================
-
-Next steps:
-  1. Open KukuTV on the emulator
-  2. If still asks for Play Services → open MicroG app → enable all toggles
-  3. Log in with phone number + OTP (proxy is OFF so it will work)
-  4. After login:
+  Setup complete. Now:
+  1. Open MicroG Settings app on emulator → enable all toggles
+     (especially "Google device registration" and "Cloud Messaging")
+  2. Open KukuTV — Play Services prompt should be gone
+  3. Log in with phone + OTP  (proxy is OFF)
+  4. After login run:
        python scripts/fix_cert.py
        python scripts/login_mode.py on
-  5. Browse KukuTV then:
-       ./run.sh analyze
+  5. Browse KukuTV → ./run.sh analyze
+============================================================
 """)
