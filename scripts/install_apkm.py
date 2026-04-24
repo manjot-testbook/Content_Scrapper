@@ -85,6 +85,9 @@ def install_apks(adb: str, serial: str, apk_files: list[str]) -> None:
     if result.returncode == 0:
         console.print("[green bold]✓ Installation successful![/green bold]")
         console.print(result.stdout)
+    elif "VERSION_DOWNGRADE" in result.stderr:
+        console.print("[yellow]⚠ Newer version already installed — skipping downgrade.[/yellow]")
+        console.print("[green]✓ App is ready to use.[/green]")
     else:
         console.print(f"[red]Installation failed:[/red]\n{result.stderr}")
         sys.exit(1)

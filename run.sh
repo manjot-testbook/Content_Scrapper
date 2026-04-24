@@ -12,7 +12,7 @@
 #   ./run.sh proxy     → start proxy only (background)
 #   ./run.sh navigate  → run Appium navigator only
 #   ./run.sh bypass    → Frida SSL pinning bypass
-#   ./run.sh stop      → stop proxy + clear device proxy
+#   ./run.sh fix-net   → clear stale proxy, restore internet on emulator
 #   ./run.sh status    → print current state
 # =============================================================================
 
@@ -185,12 +185,29 @@ stop_proxy() {
         rm -f "$PROJECT/logs/mitm.pid"
         ok "mitmproxy stopped"
     fi
-    # Clear device proxy
-    "$ADB" shell settings put global http_proxy ":0" 2>/dev/null || true
-    ok "Device proxy cleared"
+    clear_device_proxy
+}
+
+clear_device_proxy() {
+    # :0 is the Android convention for "no proxy"
+    "$ADB" shell settings put global http_proxy :0 2>/dev/null || true
+    "$ADB" shell settings delete global http_proxy 2>/dev/null || true
+    ok "Device proxy cleared — internet should be restored"
+    local cur
+    cur=$("$ADB" shell settings get global http_proxy 2>/dev/null)
+    log "Current proxy value: '${cur}'"
 }
 
 # ── commands ──────────────────────────────────────────────────────────────────
+
+cmd_fixnet() {
+    log "Clearing stale proxy settings from emulator..."
+    clear_device_proxy
+    log "Restarting DNS on emulator..."
+    "$ADB" shell ndc resolver flushdefaultif 2>/dev/null || true
+    ok "Done — emulator internet should be restored."
+    warn "If Play Store still fails, reboot emulator: adb reboot"
+}
 
 cmd_install() {
     local apkm
@@ -291,6 +308,7 @@ shift 2>/dev/null || true
 case "$CMD" in
     status)   cmd_status ;;
     emulator) cmd_emulator ;;
+    fix-net)  cmd_fixnet ;;
     install)  cmd_install "$@" ;;
     proxy)    cmd_proxy ;;
     stop)     cmd_stop ;;
