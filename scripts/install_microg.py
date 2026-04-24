@@ -7,17 +7,44 @@ provides a compatible implementation without needing the Play Store.
 
 Run: python scripts/install_microg.py
 """
-import os, subprocess, sys, urllib.request, tempfile, time
+import os, subprocess, sys, urllib.request, urllib.error, tempfile, time, json
 
 ADB = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
 
-# MicroG APKs — stable release
-MICROG_APKS = {
-    "GmsCore (Play Services replacement)":
-        "https://github.com/microg/GmsCore/releases/download/v0.3.4.240913/com.google.android.gms-240913017-hw.apk",
-    "FakeStore (Play Store stub)":
-        "https://github.com/microg/GmsCore/releases/download/v0.3.4.240913/com.android.vending-240913017.apk",
-}
+def get_microg_urls():
+    """Fetch latest MicroG APK URLs from GitHub API."""
+    print("  Fetching latest MicroG release info from GitHub...")
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/microg/GmsCore/releases/latest",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        urls = {}
+        for asset in data.get("assets", []):
+            name = asset["name"]
+            url  = asset["browser_download_url"]
+            if "com.google.android.gms" in name and name.endswith(".apk"):
+                urls["GmsCore (Play Services)"] = url
+            elif "com.android.vending" in name and name.endswith(".apk"):
+                urls["FakeStore (Play Store stub)"] = url
+        if urls:
+            print(f"  Found {len(urls)} APK(s) in release {data.get('tag_name')}")
+            return urls
+    except Exception as e:
+        print(f"  GitHub API failed: {e}")
+
+    # Hardcoded fallback — latest known working
+    print("  Using hardcoded fallback URLs...")
+    tag = "v0.3.15.250932"
+    base = f"https://github.com/microg/GmsCore/releases/download/{tag}"
+    return {
+        "GmsCore (Play Services)": f"{base}/com.google.android.gms-250932037-hw.apk",
+        "FakeStore (Play Store stub)": f"{base}/com.android.vending-84022630-hw.apk",
+    }
+
+MICROG_APKS = get_microg_urls()
 
 def adb(*args):
     r = subprocess.run([ADB] + list(args), capture_output=True, text=True)
@@ -48,6 +75,23 @@ def install(apk, label):
     print(f"  ✗ Failed: {(err or err2)[:200]}")
     return False
 
+def uninstall_system_app(package):
+    """Remove system app updates and disable so MicroG can replace it."""
+    print(f"  Uninstalling system {package} ...")
+    # Remove user-installed updates first
+    adb("shell", "pm", "uninstall", "-k", "--user", "0", package)
+    # If still present as system app, delete the APK via root
+    out, _, _ = adb("shell", f"pm path {package}")
+    for line in out.splitlines():
+        if "package:" in line:
+            path = line.split("package:")[-1].strip()
+            # Only delete if it's in /system or /data/app
+            if path:
+                adb("shell", f"rm -f {path}")
+                # Also remove base dir
+                adb("shell", f"rm -rf {os.path.dirname(path)}")
+    print(f"  ✓ Removed {package}")
+
 # Check device
 out, _, _ = adb("devices")
 if "emulator" not in out and len(out.split("\n")) < 2:
@@ -55,15 +99,35 @@ if "emulator" not in out and len(out.split("\n")) < 2:
     sys.exit(1)
 
 # Enable root (needed on KukuTV_Root)
-print("[0] Enabling root...")
+print("[0] Enabling root + remount...")
 adb("root")
-time.sleep(3)
+time.sleep(4)
+adb("remount")
+time.sleep(2)
 
-print("\n[1] Downloading MicroG APKs...")
+print("\n[1] Removing existing Google Play Services / Play Store (system apps)...")
+for pkg in ["com.google.android.gms", "com.android.vending"]:
+    uninstall_system_app(pkg)
+
+print("\n[2] Rebooting to clear package manager state...")
+adb("reboot")
+time.sleep(12)
+print("  Waiting for boot", end="", flush=True)
+for _ in range(30):
+    out, _, _ = adb("shell", "getprop sys.boot_completed")
+    if out.strip() == "1": print(" ✓"); break
+    time.sleep(5); print(".", end="", flush=True)
+adb("root"); time.sleep(4)
+
+print("\n[3] Downloading MicroG APKs...")
+if not MICROG_APKS:
+    print("ERROR: Could not determine MicroG download URLs.")
+    sys.exit(1)
+
 with tempfile.TemporaryDirectory() as tmp:
     apk_files = []
     for label, url in MICROG_APKS.items():
-        dest = os.path.join(tmp, os.path.basename(url).split("?")[0])
+        dest = os.path.join(tmp, url.split("/")[-1].split("?")[0])
         if download(url, dest):
             apk_files.append((dest, label))
 
@@ -71,11 +135,11 @@ with tempfile.TemporaryDirectory() as tmp:
         print("ERROR: Could not download any APKs. Check internet connection.")
         sys.exit(1)
 
-    print("\n[2] Installing MicroG...")
+    print("\n[4] Installing MicroG...")
     for apk, label in apk_files:
         install(apk, label)
 
-print("\n[3] Granting permissions to MicroG...")
+print("\n[5] Granting permissions to MicroG...")
 perms = [
     "android.permission.ACCESS_COARSE_LOCATION",
     "android.permission.ACCESS_FINE_LOCATION",
@@ -88,7 +152,7 @@ for p in perms:
     adb("shell", "pm", "grant", "com.google.android.gms", p)
 print("  ✓ Permissions granted")
 
-print("\n[4] Rebooting to apply MicroG...")
+print("\n[6] Rebooting to apply MicroG...")
 adb("reboot")
 time.sleep(12)
 print("  Waiting for boot", end="", flush=True)
