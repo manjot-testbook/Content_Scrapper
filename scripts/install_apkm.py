@@ -74,24 +74,33 @@ def install_apks(adb: str, serial: str, apk_files: list[str]) -> None:
 
 
 def get_package_name(apkm_path: str) -> str | None:
-    """Try to extract package name from the base APK using aapt2."""
-    with tempfile.TemporaryDirectory() as tmp:
-        with zipfile.ZipFile(apkm_path, "r") as zf:
-            for name in zf.namelist():
-                if name == "base.apk" or (name.endswith(".apk") and "base" in name.lower()):
-                    zf.extract(name, tmp)
-                    apk_path = os.path.join(tmp, name)
-                    result = subprocess.run(
-                        ["aapt2", "dump", "badging", apk_path],
-                        capture_output=True, text=True,
-                    )
-                    if result.returncode == 0:
-                        for line in result.stdout.splitlines():
-                            if line.startswith("package:"):
-                                # package: name='com.example' ...
-                                parts = line.split("name='")
-                                if len(parts) > 1:
-                                    return parts[1].split("'")[0]
+    """Try to extract package name from the base APK using aapt2, or infer from filename."""
+    # Try inferring from filename first (e.g. com.vlv.aravali.reels_5.7.1-...)
+    basename = os.path.basename(apkm_path)
+    parts = basename.split("_")
+    if parts and parts[0].count(".") >= 2:
+        return parts[0]
+
+    # Try aapt2 if available
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            with zipfile.ZipFile(apkm_path, "r") as zf:
+                for name in zf.namelist():
+                    if name == "base.apk" or (name.endswith(".apk") and "base" in name.lower()):
+                        zf.extract(name, tmp)
+                        apk_path = os.path.join(tmp, name)
+                        result = subprocess.run(
+                            ["aapt2", "dump", "badging", apk_path],
+                            capture_output=True, text=True,
+                        )
+                        if result.returncode == 0:
+                            for line in result.stdout.splitlines():
+                                if line.startswith("package:"):
+                                    p = line.split("name='")
+                                    if len(p) > 1:
+                                        return p[1].split("'")[0]
+    except FileNotFoundError:
+        console.print("[dim]aapt2 not found, skipping detailed package detection[/dim]")
     return None
 
 

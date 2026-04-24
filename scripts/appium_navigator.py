@@ -219,7 +219,7 @@ def dump_page_source(driver, label: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Navigate KukuTV app via Appium")
-    parser.add_argument("--package", default="com.kukufm.android", help="App package name")
+    parser.add_argument("--package", default="com.vlv.aravali.reels", help="App package name")
     parser.add_argument("--activity", default="", help="Main activity (auto-detected if empty)")
     parser.add_argument("--appium-url", default="http://127.0.0.1:4723", help="Appium server URL")
     parser.add_argument("--device", default="emulator-5554", help="Device name")

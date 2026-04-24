@@ -8,4 +8,8 @@ metadata/api_catalog/
 metadata/content/
 metadata/page_sources/
 *.apkm
+*.zip
 .DS_Store
+__pycache__/
+*.pyc
+*.pyo

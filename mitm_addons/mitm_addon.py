@@ -74,10 +74,22 @@ class KukuTVCapture:
             elif "video" in ct or "audio" in ct or "octet-stream" in ct:
                 record["response_body"] = f"<binary: {len(response.content)} bytes>"
 
-        # Check if this is a KukuTV-related request
+        # Check if this is a KukuTV / Aravali / VLV-related request
+        # Package: com.vlv.aravali.reels — API domains may not contain "kuku"
         is_kukutv = False
         host = (parsed.hostname or "").lower()
-        if any(kw in host for kw in ["kuku", "kukutv", "kukufm"]):
+        KUKU_KEYWORDS = [
+            "kuku", "kukutv", "kukufm",
+            "vlv", "aravali",               # APK vendor names
+        ]
+        # Mark well-known pure third-party hosts so we don't flag them
+        SKIP_HOSTS = [
+            "google", "firebase", "crashlytics", "appsflyer",
+            "facebook", "branch.io", "adjust", "amplitude",
+            "doubleclick", "googleapis", "gstatic",
+        ]
+        is_third_party = any(s in host for s in SKIP_HOSTS)
+        if any(kw in host for kw in KUKU_KEYWORDS) or not is_third_party:
             is_kukutv = True
             self.kukutv_count += 1
 

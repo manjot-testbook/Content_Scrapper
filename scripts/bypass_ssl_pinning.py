@@ -9,6 +9,7 @@ Prerequisites:
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -127,12 +128,23 @@ def check_frida_server(device_serial: str | None = None):
 
 def main():
     parser = argparse.ArgumentParser(description="Bypass SSL pinning on KukuTV using Frida")
-    parser.add_argument("--package", default="com.kukufm.android", help="App package name")
+    parser.add_argument("--package", default="com.vlv.aravali.reels", help="App package name")
     parser.add_argument("--device", default=None, help="Device serial")
     parser.add_argument("--spawn", action="store_true", help="Spawn app (vs attach to running)")
     args = parser.parse_args()
 
     check_frida_server(args.device)
+
+    # Load bypass script — prefer external JS for easier editing
+    js_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "mitm_addons", "frida_ssl_bypass.js")
+    if os.path.isfile(js_path):
+        with open(js_path) as f:
+            bypass_script = f.read()
+        console.print(f"[dim]Loaded bypass script: {js_path}[/dim]")
+    else:
+        bypass_script = SSL_BYPASS_SCRIPT
+        console.print("[yellow]Using built-in bypass script[/yellow]")
 
     console.print(f"\n[bold]Frida SSL Pinning Bypass[/bold]")
     console.print(f"Package: {args.package}")
@@ -150,13 +162,13 @@ def main():
             pid = device.spawn([args.package])
             console.print(f"[cyan]Spawned {args.package} (PID: {pid})[/cyan]")
             session = device.attach(pid)
-            script = session.create_script(SSL_BYPASS_SCRIPT)
+            script = session.create_script(bypass_script)
             script.on("message", lambda msg, data: console.print(f"  [dim]{msg}[/dim]"))
             script.load()
             device.resume(pid)
         else:
             session = device.attach(args.package)
-            script = session.create_script(SSL_BYPASS_SCRIPT)
+            script = session.create_script(bypass_script)
             script.on("message", lambda msg, data: console.print(f"  [dim]{msg}[/dim]"))
             script.load()
 
