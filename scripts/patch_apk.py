@@ -34,6 +34,11 @@ BUILD_TOOLS = sorted(glob.glob(os.path.expanduser("~/Library/Android/sdk/build-t
 APKSIGNER = BUILD_TOOLS[0] if BUILD_TOOLS else "apksigner"
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def adb(*args):
+    r = subprocess.run([ADB] + list(args), capture_output=True, text=True)
+    return r.stdout.strip(), r.stderr.strip(), r.returncode
+
 NETWORK_SECURITY_CONFIG = """\
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
@@ -57,6 +62,31 @@ NETWORK_SECURITY_CONFIG = """\
     </domain-config>
 </network-security-config>
 """
+
+
+APKTOOL_JAR_PATHS = [
+    "/tmp/apktool.jar",
+    os.path.expanduser("~/apktool.jar"),
+    os.path.join(PROJECT, "tools", "apktool.jar"),
+]
+
+
+def find_apktool() -> list | None:
+    """Return the command to invoke apktool (binary or java -jar)."""
+    binary = shutil.which("apktool")
+    if binary:
+        return [binary]
+    # Try java -jar
+    for jar in APKTOOL_JAR_PATHS:
+        if os.path.isfile(jar):
+            java = shutil.which("java")
+            if java:
+                # Quick validation
+                r = subprocess.run([java, "-jar", jar, "--version"], capture_output=True, text=True)
+                if r.returncode == 0:
+                    console.print(f"[dim]Using apktool jar: {jar}[/dim]")
+                    return [java, "-jar", jar]
+    return None
 
 
 def check_tool(name: str) -> str | None:
@@ -106,9 +136,11 @@ def pull_apk_from_device(package: str, dest: str) -> str | None:
 
 def patch_with_apktool(base_apk: str, output_apk: str) -> bool:
     """Decompile APK, inject network_security_config, recompile."""
-    apktool = check_tool("apktool")
-    if not apktool:
-        console.print("[red]apktool not found. Install with: brew install apktool[/red]")
+    apktool_cmd = find_apktool()
+    if not apktool_cmd:
+        console.print("[red]apktool not found.[/red]")
+        console.print("  Download: curl -L https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -o /tmp/apktool.jar")
+        console.print("  Or install: brew install apktool")
         return False
 
     with tempfile.TemporaryDirectory() as work_dir:
@@ -116,7 +148,7 @@ def patch_with_apktool(base_apk: str, output_apk: str) -> bool:
 
         # Decompile
         console.print("  Decompiling APK with apktool...")
-        out, err, code = run([apktool, "d", base_apk, "-o", decoded_dir, "--force"], cwd=work_dir)
+        out, err, code = run(apktool_cmd + ["d", base_apk, "-o", decoded_dir, "--force"], cwd=work_dir)
         if code != 0:
             console.print(f"[red]apktool decompile failed:\n{err}[/red]")
             return False
@@ -157,7 +189,7 @@ def patch_with_apktool(base_apk: str, output_apk: str) -> bool:
         # Recompile
         console.print("  Recompiling...")
         unsigned_apk = os.path.join(work_dir, "unsigned.apk")
-        out, err, code = run([apktool, "b", decoded_dir, "-o", unsigned_apk, "--use-aapt2"], cwd=work_dir)
+        out, err, code = run(apktool_cmd + ["b", decoded_dir, "-o", unsigned_apk], cwd=work_dir)
         if code != 0:
             console.print(f"[red]apktool build failed:\n{err[-500:]}[/red]")
             return False
@@ -202,23 +234,44 @@ def patch_with_apktool(base_apk: str, output_apk: str) -> bool:
     return False
 
 
-def install_patched(patched_apk: str, package: str):
-    """Install the patched APK over the existing installation."""
-    console.print("\n[cyan]Installing patched APK...[/cyan]")
-    out, err, code = adb("install", "-r", "-d", "--bypass-low-target-sdk-block", patched_apk)
-    if code != 0:
-        # Try without bypass flag (older adb)
-        out, err, code = adb("install", "-r", "-d", patched_apk)
+def install_patched(patched_apk: str, package: str, apkm_path: str = None):
+    """Install the patched base.apk together with all original split APKs."""
+    console.print("\n[cyan]Installing patched APK (split install)...[/cyan]")
+
+    split_apks = []
+
+    # If we have the APKM, extract splits to a temp dir and use them
+    if apkm_path and os.path.isfile(apkm_path):
+        import tempfile, zipfile as _zf
+        _tmp = tempfile.mkdtemp()
+        with _zf.ZipFile(apkm_path) as zf:
+            for name in zf.namelist():
+                if name.endswith(".apk") and name != "base.apk":
+                    zf.extract(name, _tmp)
+                    split_apks.append(os.path.join(_tmp, name))
+        console.print(f"  Using {len(split_apks)} split APKs from APKM")
+
+    # Build install command: patched base + all splits
+    all_apks = [patched_apk] + split_apks
+    cmd = [ADB, "install-multiple", "-r", "-d"] + all_apks
+    console.print(f"  Installing {len(all_apks)} APKs total...")
+    out, err, code = run(cmd)
+
     if code == 0 or "Success" in out:
         console.print("[green bold]✓ Patched app installed![/green bold]")
-        console.print("[yellow]Note: App is signed with debug key — must uninstall first if signature mismatch.[/yellow]")
+        console.print("[yellow]Note: Signed with debug key. If signature mismatch, uninstall first:[/yellow]")
+        console.print(f"  adb uninstall {package}")
     else:
-        console.print(f"[red]Install failed: {err}[/red]")
-        if "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in err:
-            console.print("\n[yellow]Signature mismatch — uninstall first:[/yellow]")
-            console.print(f"  adb uninstall {package}")
-            console.print(f"  adb install {patched_apk}")
-            console.print("[red]Warning: Uninstalling will delete app data (login, cache)[/red]")
+        console.print(f"[red]Install failed:[/red] {err}")
+        if "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in err or "INSTALL_FAILED_INVALID_APK" in err:
+            console.print("\n[yellow]Trying after uninstall (will clear app data)...[/yellow]")
+            adb("uninstall", package)
+            out2, err2, code2 = run(cmd)
+            if code2 == 0 or "Success" in out2:
+                console.print("[green bold]✓ Installed after uninstall![/green bold]")
+                console.print("[yellow]⚠ App data cleared — you'll need to log in again.[/yellow]")
+            else:
+                console.print(f"[red]Still failed: {err2}[/red]")
 
 
 def main():
@@ -268,7 +321,7 @@ def main():
             sys.exit(1)
 
     if not args.no_install:
-        install_patched(output_apk, args.package)
+        install_patched(output_apk, args.package, apkm_path=apkm_path)
 
     console.print("\n[bold green]Done![/bold green]")
     console.print("Now run: [cyan]./run.sh capture[/cyan]")

@@ -3,8 +3,9 @@
 # KukuTV Content Scraper — Master Run Script
 # =============================================================================
 # Usage:
-#   ./run.sh emulator  → start Android emulator (Play Store AVD preferred)
-#   ./run.sh install   → sideload KukuTV APKM onto connected emulator
+#   ./run.sh emulator  → start Android emulator (Play Store AVD required)
+#   ./run.sh install   → open Play Store on device to install KukuTV
+#   ./run.sh patch     → pull APK from device, patch NSC to trust user CAs, reinstall
 #   ./run.sh capture   → start proxy + navigate app + capture APIs
 #   ./run.sh analyze   → analyze captured traffic
 #   ./run.sh scrape    → download videos from discovered URLs
@@ -77,7 +78,7 @@ start_emulator() {
     if ! grep -q 'playstore' "$cfg" 2>/dev/null; then
         warn "AVD '$avd' does NOT have Google Play Store."
         warn "KukuTV requires Google Play Services. Use 'Google Play' system image in AVD Manager."
-        warn "Continuing anyway — you can sideload via: ./run.sh install"
+        warn "Continuing anyway — install KukuTV from Play Store inside the emulator, then run: ./run.sh patch"
     else
         ok "AVD '$avd' has Google Play Store ✓"
     fi
@@ -127,7 +128,8 @@ check_app() {
         ok "KukuTV app installed"
     else
         err "KukuTV (com.vlv.aravali.reels) not installed on device."
-        echo "  Install from Play Store, then re-run."
+        echo "  Run './run.sh install' to open Play Store, or install it manually."
+        echo "  After installing, run './run.sh patch' to bypass SSL pinning."
         return 1
     fi
 }
@@ -223,14 +225,25 @@ cmd_fixnet() {
 }
 
 cmd_install() {
-    local apkm
-    apkm=$(ls "$PROJECT"/apkm/*.apkm 2>/dev/null | head -1)
-    if [ -z "$apkm" ]; then
-        err "No .apkm file found in apkm/ directory."
-        return 1
-    fi
-    log "Installing: $apkm"
-    "$PYTHON" "$PROJECT/scripts/install_apkm.py" --apkm "$apkm" "$@"
+    # KukuTV must be installed via Google Play Store inside the emulator.
+    local pkg="com.vlv.aravali.reels"
+    local play_url="https://play.google.com/store/apps/details?id=${pkg}"
+
+    log "KukuTV must be installed from Google Play Store."
+    log "Opening Play Store on device..."
+    "$ADB" shell am start -a android.intent.action.VIEW \
+        -d "market://details?id=${pkg}" \
+        com.android.vending 2>/dev/null || true
+
+    log "If Play Store didn't open, manually browse to:"
+    log "  ${play_url}"
+    log "After installing KukuTV, run:  ./run.sh patch   to bypass SSL pinning."
+}
+
+cmd_patch() {
+    check_device
+    log "Patching KukuTV NSC to trust mitmproxy CA (user certificates)..."
+    "$PYTHON" "$PROJECT/scripts/swap_nsc.py"
 }
 
 cmd_emulator() {
@@ -302,8 +315,9 @@ cmd_capture() {
 
     if [ "$count" -eq 0 ]; then
         warn "No traffic captured — app may have SSL pinning."
-        warn "Try:  ./run.sh bypass   (requires Frida/rooted emulator)"
-        warn "Or manually browse the app for ~2 minutes while proxy is running."
+        warn "Run:  ./run.sh patch   to patch NSC and trust mitmproxy CA (no root needed)."
+        warn "Or:   ./run.sh bypass  (requires Frida + rooted emulator)"
+        warn "Then browse the app manually for ~2 minutes while proxy is running."
     fi
 }
 
@@ -325,6 +339,7 @@ case "$CMD" in
     install-cert) cmd_install_cert "$@" ;;
     patch-apk)    cmd_patch_apk "$@" ;;
     install)      cmd_install "$@" ;;
+    patch)        cmd_patch ;;
     proxy)    cmd_proxy ;;
     stop)     cmd_stop ;;
     navigate) cmd_navigate "$@" ;;
@@ -334,7 +349,7 @@ case "$CMD" in
     capture)  cmd_capture ;;
     all)      cmd_all ;;
     *)
-        echo "Usage: ./run.sh [status|emulator|install|proxy|stop|navigate|analyze|scrape|bypass|capture|all]"
+        echo "Usage: ./run.sh [status|emulator|install|patch|proxy|stop|navigate|analyze|scrape|bypass|capture|all|fix-net]"
         exit 1
         ;;
 esac
