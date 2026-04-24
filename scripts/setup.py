@@ -14,19 +14,16 @@ What this does (in order):
 
 Run: python scripts/setup.py
 """
-import os, subprocess, sys, time, shutil, lzma, json
-import urllib.request
+import os, subprocess, sys, time, json, lzma, shutil, urllib.request, tempfile
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ADB       = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
-EMULATOR  = os.path.expanduser("~/Library/Android/sdk/emulator/emulator")
-AVDMGR    = os.path.expanduser("~/Library/Android/sdk/cmdline-tools/latest/bin/avdmanager")
-PROJECT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AVD_NAME  = "KukuCapture"
-PACKAGE   = "com.vlv.aravali.reels"
-APK_CACHE = "/tmp/kukutv_apks"
-CERT_PEM  = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
-MITM_PORT = 8080
+ADB      = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
+EMULATOR = os.path.expanduser("~/Library/Android/sdk/emulator/emulator")
+PROJECT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AVD_NAME = "KukuCapture"
+PACKAGE  = "com.vlv.aravali.reels"
+APK_CACHE= "/tmp/kukutv_apks"
+CERT_PEM = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def run(*cmd, check=False):
@@ -61,205 +58,146 @@ print("\n" + "="*60)
 print("  KukuTV Capture Setup — Fresh Start")
 print("="*60 + "\n")
 
-# ── Step 1: Create AVD ────────────────────────────────────────────────────────
-print("[1] Creating AVD...")
-# Delete if exists
-run(AVDMGR, "delete", "avd", "-n", AVD_NAME)
+# ── Step 1: Create AVD manually (no avdmanager/Java needed) ──
+print("[1] Creating AVD manually (no avdmanager needed)...")
+SDK = os.path.expanduser("~/Library/Android/sdk")
+SYS_IMG = "system-images/android-33/google_apis/arm64-v8a"
+AVD_DIR = os.path.expanduser(f"~/.android/avd/{AVD_NAME}.avd")
+AVD_INI = os.path.expanduser(f"~/.android/avd/{AVD_NAME}.ini")
 
-# Find available google_apis image
-sdk_imgs = os.path.expanduser("~/Library/Android/sdk/system-images")
-ga_image = None
-for api in ["android-33", "android-34", "android-32", "android-31", "android-30"]:
-    path = os.path.join(sdk_imgs, api, "google_apis", "arm64-v8a")
-    if os.path.isdir(path):
-        ga_image = f"system-images;{api};google_apis;arm64-v8a"
-        print(f"  Found: {ga_image}")
-        break
+if os.path.exists(AVD_DIR): shutil.rmtree(AVD_DIR)
+if os.path.exists(AVD_INI): os.remove(AVD_INI)
+os.makedirs(AVD_DIR)
 
-if not ga_image:
-    print("  ERROR: No google_apis system image found.")
-    print("  Install one in Android Studio: SDK Manager → System Images → Google APIs (not Google Play)")
-    print("  Suggested: Android 13 (API 33) → ABI: arm64-v8a → Google APIs")
-    sys.exit(1)
+open(AVD_INI,"w").write(
+    f"avd.ini.encoding=UTF-8\n"
+    f"path={AVD_DIR}\n"
+    f"path.rel=avd/{AVD_NAME}.avd\n"
+    f"target=android-33\n"
+)
+open(os.path.join(AVD_DIR,"config.ini"),"w").write(
+    f"AvdId={AVD_NAME}\n"
+    f"avd.ini.displayname={AVD_NAME}\n"
+    f"hw.cpu.arch=arm64\n"
+    f"hw.cpu.ncore=4\n"
+    f"hw.ramSize=3072\n"
+    f"hw.lcd.width=1080\n"
+    f"hw.lcd.height=2400\n"
+    f"hw.lcd.density=420\n"
+    f"hw.keyboard=yes\n"
+    f"hw.gpu.enabled=yes\n"
+    f"hw.gpu.mode=auto\n"
+    f"hw.sdCard=yes\n"
+    f"sdcard.size=512M\n"
+    f"image.sysdir.1={SYS_IMG}/\n"
+    f"tag.id=google_apis\n"
+    f"tag.display=Google APIs\n"
+    f"hw.device.name=pixel_6\n"
+    f"showDeviceFrame=yes\n"
+    f"PlayStore.enabled=false\n"
+)
+print(f"  ✓ AVD '{AVD_NAME}' created (android-33 google_apis)")
 
-out, err, code = run(AVDMGR, "create", "avd",
-    "-n", AVD_NAME,
-    "-k", ga_image,
-    "-d", "pixel_6",
-    "--force")
-if code != 0 and "already exists" not in err:
-    print(f"  ERROR creating AVD: {err}")
-    sys.exit(1)
-print(f"  ✓ AVD '{AVD_NAME}' created")
-
-# ── Step 2: Start emulator with -writable-system ──────────────────────────────
+# ── Step 2: Start emulator ────────────────────────────────────
 print("\n[2] Starting emulator with -writable-system...")
-os.makedirs(os.path.join(PROJECT, "logs"), exist_ok=True)
-log = open(os.path.join(PROJECT, "logs", "emulator.log"), "w")
+os.makedirs(os.path.join(PROJECT,"logs"), exist_ok=True)
+log = open(os.path.join(PROJECT,"logs","emulator.log"),"w")
 subprocess.Popen(
-    [EMULATOR, "-avd", AVD_NAME, "-writable-system", "-no-snapshot-save", "-no-audio", "-gpu", "swiftshader_indirect"],
+    [EMULATOR, "-avd", AVD_NAME, "-writable-system",
+     "-no-snapshot-save", "-no-audio", "-gpu", "swiftshader_indirect"],
     stdout=log, stderr=log
 )
-time.sleep(10)
+time.sleep(12)
 wait_boot()
 
-# ── Step 3: Root + remount ────────────────────────────────────────────────────
-print("\n[3] Enabling root + remounting /system...")
-out, err, _ = adb("root")
-print(f"  root: {out or err}")
-time.sleep(5)
-
-out, err, code = adb("remount")
-print(f"  remount: {out or err}")
-if "remount failed" in (out + err).lower():
-    print("  Trying disable-verity + reboot...")
-    adb("disable-verity")
-    time.sleep(2)
-    adb("reboot")
-    time.sleep(15)
-    wait_boot()
-    adb("root"); time.sleep(5)
-    out, err, _ = adb("remount")
-    print(f"  remount after disable-verity: {out or err}")
+# ── Step 3: Root + remount ────────────────────────────────────
+print("\n[3] Root + remount...")
+o,e,_ = adb("root"); print(f"  root: {o or e}"); time.sleep(5)
+o,e,_ = adb("remount"); print(f"  remount: {o or e}")
+if "failed" in (o+e).lower():
+    print("  Trying disable-verity...")
+    adb("disable-verity"); adb("reboot"); time.sleep(15)
+    wait_boot(); adb("root"); time.sleep(5)
+    o,e,_ = adb("remount"); print(f"  remount: {o or e}")
 time.sleep(2)
 
-# ── Step 4: Push MicroG directly into /system/priv-app/ ──────────────────────
-print("\n[4] Installing MicroG into /system/priv-app/ (replacing GMS)...")
-
-# Get MicroG URLs
+# ── Step 4: Push MicroG into /system/priv-app/ ───────────────
+print("\n[4] Installing MicroG into /system/priv-app/...")
 try:
-    req = urllib.request.Request(
-        "https://api.github.com/repos/microg/GmsCore/releases/latest",
-        headers={"User-Agent": "Mozilla/5.0"})
+    req = urllib.request.Request("https://api.github.com/repos/microg/GmsCore/releases/latest",headers={"User-Agent":"Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=15) as r:
         data = json.loads(r.read())
-    gms_url = next((a["browser_download_url"] for a in data["assets"]
-                    if "com.google.android.gms" in a["name"] and a["name"].endswith(".apk")), None)
-    vend_url = next((a["browser_download_url"] for a in data["assets"]
-                     if "com.android.vending" in a["name"] and a["name"].endswith(".apk")), None)
-    print(f"  MicroG release: {data.get('tag_name')}")
+    gms_url  = next(a["browser_download_url"] for a in data["assets"] if "com.google.android.gms" in a["name"] and a["name"].endswith(".apk"))
+    vend_url = next(a["browser_download_url"] for a in data["assets"] if "com.android.vending" in a["name"] and a["name"].endswith(".apk"))
+    print(f"  MicroG: {data.get('tag_name')}")
 except Exception as e:
-    print(f"  GitHub API failed: {e} — using fallback")
-    tag = "v0.3.15.250932"
-    base = f"https://github.com/microg/GmsCore/releases/download/{tag}"
-    gms_url  = f"{base}/com.google.android.gms-250932030.apk"
-    vend_url = f"{base}/com.android.vending-84022630.apk"
+    print(f"  Fallback ({e})")
+    tag="v0.3.15.250932"; base=f"https://github.com/microg/GmsCore/releases/download/{tag}"
+    gms_url=f"{base}/com.google.android.gms-250932030.apk"; vend_url=f"{base}/com.android.vending-84022630.apk"
 
-import tempfile
 with tempfile.TemporaryDirectory() as tmp:
-    gms_apk  = os.path.join(tmp, "GmsCore.apk")
-    vend_apk = os.path.join(tmp, "FakeStore.apk")
-    download(gms_url,  gms_apk)
-    download(vend_url, vend_apk)
-
-    # Find and delete existing GMS in /system and /product
-    for pkg in ["com.google.android.gms", "com.android.vending"]:
-        out_pm, _, _ = adb("shell", f"pm path {pkg}")
-        for line in out_pm.splitlines():
+    gms=os.path.join(tmp,"GmsCore.apk"); vend=os.path.join(tmp,"FakeStore.apk")
+    download(gms_url,gms); download(vend_url,vend)
+    for pkg in ["com.google.android.gms","com.android.vending"]:
+        o,_,_ = adb("shell",f"pm path {pkg}")
+        for line in o.splitlines():
             if "package:" in line:
-                apk_path = line.split("package:")[-1].strip()
-                pkg_dir  = os.path.dirname(apk_path)
-                print(f"  Deleting existing: {pkg_dir}")
-                sh(f"rm -rf '{pkg_dir}'")
+                d=os.path.dirname(line.split("package:")[-1].strip())
+                print(f"  Removing existing: {d}"); sh(f"rm -rf '{d}'")
+    for apk,name in [(gms,"GmsCore"),(vend,"FakeStore")]:
+        d=f"/system/priv-app/{name}"; sh(f"mkdir -p {d}")
+        adb("push",apk,f"{d}/{name}.apk"); sh(f"chmod 644 {d}/{name}.apk"); sh(f"chown root:root {d}/{name}.apk")
+        print(f"  ✓ {name} → {d}/")
 
-    # Push MicroG directly into /system/priv-app/
-    for apk, name in [(gms_apk, "GmsCore"), (vend_apk, "FakeStore")]:
-        dest_dir = f"/system/priv-app/{name}"
-        sh(f"mkdir -p {dest_dir}")
-        adb("push", apk, f"{dest_dir}/{name}.apk")
-        sh(f"chmod 644 {dest_dir}/{name}.apk")
-        sh(f"chown root:root {dest_dir}/{name}.apk")
-        print(f"  ✓ Pushed {name} → {dest_dir}/")
-
-# ── Step 5: Install mitmproxy cert as system cert ─────────────────────────────
-print("\n[5] Installing mitmproxy CA cert as system cert...")
+# ── Step 5: System cert ───────────────────────────────────────
+print("\n[5] Installing mitmproxy cert as system cert...")
 if not os.path.isfile(CERT_PEM):
-    print("  Generating cert (running mitmdump briefly)...")
-    p = subprocess.Popen(["mitmdump", "--listen-port", "8081"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p=subprocess.Popen(["mitmdump","--listen-port","8081"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     time.sleep(5); p.terminate()
+r=subprocess.run(["openssl","x509","-inform","PEM","-subject_hash_old","-in",CERT_PEM],capture_output=True,text=True)
+ch=r.stdout.strip().splitlines()[0]; cf=f"{ch}.0"
+adb("push",CERT_PEM,f"/system/etc/security/cacerts/{cf}")
+sh(f"chmod 644 /system/etc/security/cacerts/{cf}")
+o,_,_=adb("shell",f"ls /system/etc/security/cacerts/{cf}")
+print(f"  {'✓' if cf in o else '✗'} Cert {cf}")
 
-if os.path.isfile(CERT_PEM):
-    r = subprocess.run(["openssl", "x509", "-inform", "PEM", "-subject_hash_old", "-in", CERT_PEM],
-                       capture_output=True, text=True)
-    cert_hash = r.stdout.strip().splitlines()[0]
-    cert_file = f"{cert_hash}.0"
-    adb("push", CERT_PEM, f"/system/etc/security/cacerts/{cert_file}")
-    sh(f"chmod 644 /system/etc/security/cacerts/{cert_file}")
-    sh(f"chown root:root /system/etc/security/cacerts/{cert_file}")
-    # Verify
-    out, _, _ = adb("shell", f"ls /system/etc/security/cacerts/{cert_file}")
-    if cert_file in out:
-        print(f"  ✓ Cert installed: {cert_file}")
-    else:
-        print(f"  ✗ Cert install failed")
-else:
-    print("  ✗ mitmproxy cert not found — run 'mitmdump' once first")
-
-# ── Step 6: Reboot ────────────────────────────────────────────────────────────
-print("\n[6] Rebooting (MicroG + cert take effect)...")
-adb("reboot")
-time.sleep(15)
-wait_boot()
-
-# Grant MicroG permissions after reboot
-print("  Granting MicroG permissions...")
+# ── Step 6: Reboot ────────────────────────────────────────────
+print("\n[6] Rebooting...")
+adb("reboot"); time.sleep(15); wait_boot()
 adb("root"); time.sleep(3)
-for p in ["android.permission.READ_PHONE_STATE", "android.permission.RECEIVE_SMS",
-          "android.permission.READ_SMS", "android.permission.ACCESS_COARSE_LOCATION",
-          "android.permission.GET_ACCOUNTS"]:
-    adb("shell", "pm", "grant", "com.google.android.gms", p)
-print("  ✓ Permissions granted")
+for p in ["android.permission.READ_PHONE_STATE","android.permission.RECEIVE_SMS",
+          "android.permission.READ_SMS","android.permission.ACCESS_COARSE_LOCATION","android.permission.GET_ACCOUNTS"]:
+    adb("shell","pm","grant","com.google.android.gms",p)
+print("  ✓ MicroG permissions granted")
 
-# ── Step 7: Install KukuTV ────────────────────────────────────────────────────
+# ── Step 7: Install KukuTV ────────────────────────────────────
 print("\n[7] Installing KukuTV...")
-apks = sorted([os.path.join(APK_CACHE, f)
-               for f in os.listdir(APK_CACHE) if f.endswith(".apk")]) if os.path.isdir(APK_CACHE) else []
+apks=sorted([os.path.join(APK_CACHE,f) for f in os.listdir(APK_CACHE) if f.endswith(".apk")]) if os.path.isdir(APK_CACHE) else []
+if not apks: print(f"  ERROR: No APKs in {APK_CACHE}"); sys.exit(1)
+r2=subprocess.run([ADB,"install-multiple","-r","-d"]+apks,capture_output=True,text=True)
+if r2.returncode==0 or "Success" in (r2.stdout+r2.stderr): print("  ✓ KukuTV installed")
+else: print(f"  ✗ {(r2.stderr or r2.stdout)[:200]}")
 
-if not apks:
-    print(f"  ERROR: No APKs found in {APK_CACHE}")
-    print("  Run this first with Medium_Phone emulator running and KukuTV installed:")
-    print("  python scripts/pull_apks.py")
-else:
-    print(f"  Installing {len(apks)} APKs...")
-    out, err, code = run(ADB, "install-multiple", "-r", "-d", *apks)
-    if code == 0 or "Success" in (out+err):
-        print("  ✓ KukuTV installed")
-    else:
-        print(f"  ✗ Failed: {(err or out)[:200]}")
-        print("  Try: adb install-multiple -r -d " + " ".join(apks))
-
-# ── Step 8: Start proxy ───────────────────────────────────────────────────────
-print("\n[8] Starting mitmproxy + setting device proxy...")
-subprocess.run(["pkill", "-f", "mitmdump"], capture_output=True)
-time.sleep(1)
-
-os.makedirs(os.path.join(PROJECT, "metadata", "captured_apis"), exist_ok=True)
-open(os.path.join(PROJECT, "metadata", "captured_apis", "api_traffic.jsonl"), "w").close()
-
+# ── Step 8: Proxy ─────────────────────────────────────────────
+print("\n[8] Starting mitmproxy...")
+subprocess.run(["pkill","-f","mitmdump"],capture_output=True); time.sleep(1)
+os.makedirs(os.path.join(PROJECT,"metadata","captured_apis"),exist_ok=True)
+open(os.path.join(PROJECT,"metadata","captured_apis","api_traffic.jsonl"),"w").close()
 subprocess.Popen(
-    ["mitmdump", "-s", os.path.join(PROJECT, "mitm_addons", "mitm_addon.py"),
-     "--listen-port", str(MITM_PORT), "--ssl-insecure"],
-    stdout=open(os.path.join(PROJECT, "logs", "mitm.log"), "w"),
-    stderr=subprocess.STDOUT
+    ["mitmdump","-s",os.path.join(PROJECT,"mitm_addons","mitm_addon.py"),"--listen-port","8080","--ssl-insecure"],
+    stdout=open(os.path.join(PROJECT,"logs","mitm.log"),"w"), stderr=subprocess.STDOUT
 )
 time.sleep(3)
-
-# 10.0.2.2 = Android emulator's alias for the Mac host
-adb("shell", "settings", "put", "global", "http_proxy", f"10.0.2.2:{MITM_PORT}")
-print(f"  ✓ Proxy set to 10.0.2.2:{MITM_PORT}")
+adb("shell","settings","put","global","http_proxy","10.0.2.2:8080")
+print("  ✓ Proxy → 10.0.2.2:8080")
 
 print(f"""
-{'='*60}
-  ✓ SETUP COMPLETE
-{'='*60}
-
-Now:
+{'='*55}
+  ✓ DONE
+{'='*55}
   1. Open KukuTV on the emulator
-     - MicroG replaces Play Services — login should work
-     - Log in with your phone number + OTP
-  2. Browse the app for 2-3 minutes:
-     - Home screen → tap a show → play a video → browse more
-  3. Run: python scripts/analyze.py
-     to see all captured API endpoints
+  2. Log in (phone + OTP) — MicroG handles Play Services
+  3. Browse: home → show → play video (2-3 min)
+  4. python3 scripts/analyze.py
+{'='*55}
 """)
