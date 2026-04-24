@@ -264,7 +264,7 @@ cmd_patch() {
     echo "    adb emu kill"
     echo ""
     echo "    # 3. Restart with writable system:"
-    echo "    ~/Library/Android/sdk/emulator/emulator -avd Medium_Phone -writable-system -no-snapshot-save &"
+    echo "    ~/Library/Android/sdk/emulator/emulator -avd Medium_Phone_API_36.1 -writable-system -no-snapshot-save &"
     echo ""
     echo "    # 4. Wait for boot, then:"
     echo "    adb wait-for-device && adb root && adb remount"
@@ -286,7 +286,7 @@ cmd_patch() {
 
 cmd_writable_emulator() {
     # Restart the current Play Store AVD with -writable-system so we can push system certs
-    local avd="${1:-Medium_Phone}"
+    local avd="${1:-Medium_Phone_API_36.1}"
     log "Killing running emulator..."
     "$ADB" emu kill 2>/dev/null || true
     sleep 3
