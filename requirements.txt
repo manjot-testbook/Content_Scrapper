@@ -8,3 +8,4 @@ yt-dlp>=2024.0.0
 ffmpeg-python>=0.2.0
 pydantic>=2.0.0
 rich>=13.0.0
+python-docx>=1.1.0
