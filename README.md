@@ -9,19 +9,12 @@
 Modern apps use HTTPS + certificate pinning to prevent traffic inspection.
 KukuTV uses **Pairip** (anti-tamper) + **NSC** (only trusts system certs).
 
-Two approaches were tried — one failed, one works:
-
-| Approach | Result | Why |
-|---|---|---|
-| Patch APK (inject NSC) + resign | ❌ Crash on launch | Pairip detects signature mismatch → `SIGABRT` |
-| Original APK + system cert | ✅ Works | Pairip sees original signature; mitmproxy cert is in system store |
-
 **The working approach:**
-1. Use a `google_apis` AVD (rootable — `adb root` works)
-2. Start emulator with `-writable-system`
-3. `adb root` → `adb remount` → push mitmproxy CA cert to `/system/etc/security/cacerts/`
-4. Install **original unmodified** APKs from the Play Store
-5. Pairip is happy (original signature) + mitmproxy is trusted (system cert)
+1. Use `google_apis` AVD — `adb root` works natively (no Magisk needed)
+2. Start emulator with `-writable-system` → enables `adb remount`
+3. Push mitmproxy CA cert to `/system/etc/security/cacerts/` (system store)
+4. Install **original unmodified** KukuTV APKs — Pairip sees correct signature
+5. Run mitmproxy → intercepts all HTTPS traffic
 
 ---
 
@@ -53,36 +46,34 @@ python3 scripts/setup_apk_downloader_avd.py
 #   3. Press Enter — APKs saved to apks/
 ```
 
-### Step 2 — Root the KukuCapture AVD (one time)
+### Step 2 — One-time AVD setup (creates KukuCapture + installs cert)
 
 ```bash
 python3 scripts/root_capture_avd.py
-# Interactive — follow the on-screen prompts:
-#   1. rootAVD downloads + patches Magisk into the ramdisk
-#   2. Emulator reboots — open Magisk app → tap OK → reboot again
-#   3. Tap "Grant" on the Magisk superuser popup when prompted
-#   4. mitmproxy cert is installed into system cert store
+# Fully automated — no interaction needed:
+#   1. Creates KukuCapture AVD (google_apis — adb root works natively)
+#   2. Boots with -writable-system
+#   3. adb root + adb remount + pushes mitmproxy cert to system store
+#   Done in ~3 minutes
 ```
 
-This only needs to be re-run if you recreate the AVD (`python3 GO.py --scratch`).
+Re-run this only if you delete the KukuCapture AVD.
 
-### Step 3 — Run the capture pipeline
+### Step 3 — Run the capture pipeline (every time)
 
 ```bash
-# After root_capture_avd.py has been run once:
 python3 GO.py
-
-# Recreate the AVD from scratch (then re-run root_capture_avd.py):
-python3 GO.py --scratch
+# Recreate AVD from scratch:
+python3 GO.py --scratch   # then re-run root_capture_avd.py
 ```
 
 `GO.py` will:
-1. Start the `KukuCapture` AVD with `-writable-system`
+1. Start `KukuCapture` with `-writable-system`
 2. `adb root` + `adb remount`
-3. Push mitmproxy CA cert into `/system/etc/security/cacerts/`
-4. Install original KukuTV APKs (untouched)
-5. Start `mitmdump` → logs all traffic to `metadata/captured_apis/api_traffic.jsonl`
-6. Turn proxy **OFF** (so OTP login works)
+3. Push mitmproxy cert to system store (skipped if already there)
+4. Install original KukuTV APKs (untouched — Pairip happy)
+5. Start `mitmdump` → logs to `metadata/captured_apis/api_traffic.jsonl`
+6. Turn proxy **OFF** so OTP login works
 
 ### Step 3 — Log in + capture
 
@@ -137,11 +128,10 @@ Content_Scrapper/
 
 | AVD | Image | Root | Purpose |
 |---|---|---|---|
-| `apk_downloader_avd` | `google_apis_playstore` | ❌ | Has Play Store — used to download original KukuTV APKs |
-| `KukuCapture` | `google_apis_playstore` + **Magisk** | ✅ | Full Play Services + root — used to intercept traffic |
+| `apk_downloader_avd` | `google_apis_playstore` | ❌ | Has Play Store — pull original KukuTV APKs |
+| `KukuCapture` | `google_apis` | ✅ | `adb root` works natively — used to intercept traffic |
 
-Both use `google_apis_playstore` because KukuTV checks for working Play Services at startup.  
-`KukuCapture` gets root via **rootAVD** (Magisk patched into the ramdisk) — this is a one-time setup.
+`google_apis` has `ro.debuggable=1` so `adb root` works without any extra tools. The `-writable-system` emulator flag makes `/system` writable for cert installation.
 
 ---
 
@@ -180,12 +170,12 @@ D StrictMode: StrictMode policy violation: BugleSurveyCommonConditions.isGoogleP
 ```
 
 ### ✅ Working Solution
-`google_apis_playstore` AVD + **rootAVD** (Magisk) + push cert via `su -c` + **original APK untouched**.
+`google_apis` AVD + `-writable-system` + `adb root` + push cert + **original APK untouched**.
 
-- Full Play Services → KukuTV GMS checks pass
-- Magisk gives root on a production-build image
+- `adb root` works natively (no Magisk, no rootAVD)
+- `-writable-system` makes `/system` writable → `adb remount` works
+- System cert → mitmproxy trusted by all apps including KukuTV
 - Original APK → Pairip happy
-- System cert → mitmproxy trusted
 
 ---
 
@@ -219,12 +209,11 @@ with open('metadata/captured_apis/api_traffic.jsonl') as f:
 
 | Problem | Solution |
 |---|---|
-| App opens and immediately closes | APK was tampered (Pairip). Use `python3 GO.py --scratch` then `root_capture_avd.py` |
-| "Something went wrong / Check Google Play" | GMS not working — run `python3 scripts/root_capture_avd.py` (uses `google_apis_playstore`) |
+| App opens and immediately closes | Pairip crash — APK was modified. Run `python3 GO.py` (installs original APKs) |
+| "Something went wrong / Check Google Play" | GMS dialog on google_apis — try dismissing it, OTP login usually still works |
+| `adb remount` fails | Emulator not started with `-writable-system` — GO.py handles this automatically |
 | No traffic in api_traffic.jsonl | Proxy not enabled after login — run the `settings put` command above |
-| `ERROR: Magisk is not installed` | Run `python3 scripts/root_capture_avd.py` first |
-| `Cannot get root via Magisk su` | Open Magisk app → Superuser → grant Shell, or re-run `root_capture_avd.py` |
 | `adb: no devices` | Start emulator first, or run `python3 GO.py` |
-| TLS handshake failed in mitm.log | System cert not pushed — re-run `root_capture_avd.py` |
-| `mitmproxy-ca-cert.pem` missing | GO.py generates it automatically on first run |
-| 401 on API calls | Token expired — re-run capture to get fresh session |
+| TLS handshake failed in mitm.log | System cert not pushed — restart with `python3 GO.py` |
+| `mitmproxy-ca-cert.pem` missing | GO.py generates it automatically |
+| 401 on API calls | Token expired — re-run capture |

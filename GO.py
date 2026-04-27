@@ -179,6 +179,7 @@ else:
     print(f"  Starting '{AVD_NAME}'...")
     subprocess.Popen(
         [EMULATOR, "-avd", AVD_NAME,
+         "-writable-system",        # required for adb remount to work
          "-no-snapshot-save",
          "-no-audio",
          "-gpu", "swiftshader_indirect"],
