@@ -38,10 +38,10 @@ SDKMANAGER = os.path.join(SDK, "cmdline-tools", "latest", "bin", "sdkmanager")
 PACKAGE    = "com.vlv.aravali.reels"
 HERE       = os.path.dirname(os.path.abspath(__file__))
 
-# KukuCapture AVD — google_apis_playstore (full GMS → KukuTV Play Services checks pass)
-# Root is provided by Magisk (installed once via scripts/root_capture_avd.py)
+# KukuCapture AVD — google_apis (ro.debuggable=1 → adb root works; rootAVD adds Magisk)
+# Run scripts/root_capture_avd.py once to set this up
 AVD_NAME   = "KukuCapture"
-AVD_IMAGE  = "system-images;android-33;google_apis_playstore;arm64-v8a"
+AVD_IMAGE  = "system-images;android-33;google_apis;arm64-v8a"
 AVD_DEVICE = "pixel_6"
 
 # Directories (all inside codebase, no /tmp/)
@@ -62,17 +62,9 @@ def run(*cmd, timeout=120):
 def adb(*args, timeout=60):
     return run(ADB, *args, timeout=timeout)
 
-def adb_su(*cmd, timeout=30):
-    """Run a shell command via Magisk su (requires root_capture_avd.py to have been run)."""
-    return run(ADB, "shell", "su", "0", "-c", " ".join(cmd), timeout=timeout)
-
-def magisk_installed():
-    """Return True if Magisk is present on the device."""
-    for pkg in ("io.github.huskydg.magisk", "com.topjohnwu.magisk"):
-        o, _, rc = adb("shell", "pm", "path", pkg, timeout=10)
-        if rc == 0 and "package:" in o:
-            return True
-    return False
+def adb_ok(*args, timeout=60):
+    _, _, rc = adb(*args, timeout=timeout)
+    return rc == 0
 
 def wait_for_boot():
     print("  Waiting for boot", end="", flush=True)
@@ -198,47 +190,31 @@ else:
         sys.exit(1)
     time.sleep(3)
 
-# ── Step 2: Verify Magisk root ───────────────────────────────
-print("\n[2] Verifying Magisk root...")
-if not magisk_installed():
-    print("""
-  ERROR: Magisk is not installed on this AVD.
-  Run the one-time setup first:
-
-      python3 scripts/root_capture_avd.py
-
-  Then re-run GO.py.
-""")
-    sys.exit(1)
-
-o, _, rc = adb_su("echo ROOT_OK", timeout=15)
-if "ROOT_OK" not in o:
-    print("""
-  ERROR: Cannot get root via Magisk su.
-  Make sure ADB shell is authorised in Magisk Superuser settings,
-  or re-run:  python3 scripts/root_capture_avd.py
-""")
-    sys.exit(1)
-print("  ✓ Magisk root confirmed")
+# ── Step 2: Root + remount /system ───────────────────────────
+print("\n[2] Gaining root...")
+# google_apis: ro.debuggable=1 → adb root always works (with or without Magisk)
+adb("root", timeout=15)
+time.sleep(3)
+adb("remount", timeout=20)
+o, _, _ = adb("shell", "id", timeout=10)
+print(f"  ✓ {o.strip()}")
 
 # ── Step 3: Install mitmproxy cert as SYSTEM cert ─────────────
 print("\n[3] Installing mitmproxy cert into system trust store...")
 ensure_mitm_cert()
 
 cert_hash   = get_cert_hash(MITM_CERT_PEM)
-staging     = f"/sdcard/{cert_hash}.0"
 remote_cert = f"{SYSTEM_CACERTS}/{cert_hash}.0"
 print(f"  Cert hash : {cert_hash}")
 
-# Check if cert is already installed
-o, _, _ = adb_su(f"ls {remote_cert}", timeout=10)
-if cert_hash in o or remote_cert in o:
+o, _, _ = adb("shell", "ls", remote_cert, timeout=10)
+if cert_hash in o or ".0" in o:
     print("  ✓ System cert already installed")
 else:
-    adb("push", MITM_CERT_PEM, staging, timeout=15)
-    adb_su(f"cp {staging} {remote_cert}", timeout=10)
-    adb_su(f"chmod 644 {remote_cert}", timeout=10)
-    adb_su(f"rm {staging}", timeout=10)
+    _, err, rc = adb("push", MITM_CERT_PEM, remote_cert, timeout=15)
+    if rc != 0:
+        print(f"  ERROR: {err}"); sys.exit(1)
+    adb("shell", "chmod", "644", remote_cert, timeout=10)
     print(f"  ✓ System cert installed: {remote_cert}")
 
 # ── Step 4: Install ORIGINAL KukuTV APKs (NO patching) ────────

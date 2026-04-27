@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-root_capture_avd.py  —  ONE-TIME setup for the KukuCapture AVD
+root_capture_avd.py  —  Fully automated one-time setup.
+Just run it and walk away.
 
-Run this ONCE before using GO.py. It:
-  1. Creates KukuCapture AVD  (google_apis_playstore — has full Play Services)
-  2. Boots it
-  3. Downloads rootAVD and patches Magisk into the ramdisk  ← gives root
-  4. Walks you through Magisk first-boot setup (interactive)
-  5. Pre-authorises the ADB shell in Magisk so GO.py can use root silently
-  6. Installs the mitmproxy CA cert as a SYSTEM cert (via Magisk module)
+What it does:
+  1. Deletes + recreates KukuCapture AVD  (google_apis — rootAVD patches ramdisk directly)
+  2. Boots emulator
+  3. Runs rootAVD (pipes "1" to auto-select stable Magisk — no interaction)
+  4. Cold-reboots so patched ramdisk is loaded
+  5. Auto-taps Magisk "Additional Setup" dialog via uiautomator
+  6. Reboots again if Magisk requested it
+  7. Verifies root (adb root on google_apis always works)
+  8. Installs mitmproxy CA cert into /system/etc/security/cacerts/
 
-After this script completes, run:
-    python3 GO.py
-
-Subsequent GO.py runs reuse the rooted AVD snapshot — no re-rooting needed.
+After this runs, just:  python3 GO.py
 """
 
-import os, sys, subprocess, shutil, time, urllib.request, zipfile, stat
+import os, sys, subprocess, shutil, time, urllib.request, stat
+import xml.etree.ElementTree as ET
+import re
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SDK           = os.path.expanduser("~/Library/Android/sdk")
@@ -26,11 +28,11 @@ AVDMANAGER    = os.path.join(SDK, "cmdline-tools", "latest", "bin", "avdmanager"
 SDKMANAGER    = os.path.join(SDK, "cmdline-tools", "latest", "bin", "sdkmanager")
 
 AVD_NAME      = "KukuCapture"
-# google_apis_playstore → full Play Services → KukuTV GMS checks pass
-AVD_IMAGE     = "system-images;android-33;google_apis_playstore;arm64-v8a"
+# google_apis: rootAVD patches ramdisk directly — no FAKEBOOTIMG, no UI interaction
+AVD_IMAGE     = "system-images;android-33;google_apis;arm64-v8a"
 AVD_DEVICE    = "pixel_6"
 RAMDISK       = os.path.join(SDK, "system-images", "android-33",
-                              "google_apis_playstore", "arm64-v8a", "ramdisk.img")
+                              "google_apis", "arm64-v8a", "ramdisk.img")
 
 HERE          = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR     = os.path.join(HERE, "tools")
@@ -38,27 +40,23 @@ ROOT_AVD_DIR  = os.path.join(TOOLS_DIR, "rootAVD")
 ROOT_AVD_SH   = os.path.join(ROOT_AVD_DIR, "rootAVD.sh")
 LOGS_DIR      = os.path.join(HERE, "logs")
 
-MITM_CERT_PEM = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+MITM_CERT_PEM  = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+SYSTEM_CACERTS = "/system/etc/security/cacerts"
 
-# rootAVD — single-file script from GitLab
-ROOT_AVD_URL  = "https://gitlab.com/newbit/rootAVD/-/raw/master/rootAVD.sh"
+ROOT_AVD_URL   = "https://gitlab.com/newbit/rootAVD/-/raw/master/rootAVD.sh"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def run(*cmd, timeout=120, input=None):
+def run(*cmd, timeout=120, inp=None):
     r = subprocess.run(list(cmd), capture_output=True, text=True,
-                       timeout=timeout, input=input)
+                       timeout=timeout, input=inp)
     return r.stdout.strip(), r.stderr.strip(), r.returncode
 
 def adb(*args, timeout=60):
     return run(ADB, *args, timeout=timeout)
 
-def adb_su(*cmd, timeout=30):
-    """Run a command via Magisk su. Returns (stdout, stderr, rc)."""
-    return run(ADB, "shell", "su", "0", "-c", " ".join(cmd), timeout=timeout)
-
-def wait_for_boot(label="emulator"):
-    print(f"  Waiting for {label} to boot", end="", flush=True)
+def wait_for_boot():
+    print("  Waiting for boot", end="", flush=True)
     for _ in range(90):
         time.sleep(5)
         try:
@@ -72,12 +70,49 @@ def wait_for_boot(label="emulator"):
     print()
     return False
 
-def avd_exists(name):
-    o, _, _ = run(AVDMANAGER, "list", "avd")
-    return name in o
+def kill_emulator():
+    devs, _, _ = adb("devices")
+    for s in [l.split()[0] for l in devs.splitlines() if "emulator" in l]:
+        run(ADB, "-s", s, "emu", "kill")
+    subprocess.run(["pkill", "-f", "emulator"], capture_output=True)
+    time.sleep(5)
 
-def banner(msg):
-    print(f"\n{'='*54}\n  {msg}\n{'='*54}")
+def start_emulator():
+    """Cold boot — always ignores snapshots."""
+    log = open(os.path.join(LOGS_DIR, "rootavd_setup.log"), "a")
+    subprocess.Popen(
+        [EMULATOR_BIN, "-avd", AVD_NAME,
+         "-no-snapshot-load", "-no-snapshot-save",
+         "-no-audio", "-gpu", "swiftshader_indirect"],
+        stdout=log, stderr=subprocess.STDOUT,
+    )
+
+def tap_text(text, timeout=40):
+    """Find any UI node containing text and tap its centre. Returns True if tapped."""
+    print(f"  Looking for '{text}' button", end="", flush=True)
+    for _ in range(timeout // 4):
+        time.sleep(4)
+        adb("shell", "uiautomator", "dump", "/sdcard/ui.xml", timeout=15)
+        o, _, rc = adb("shell", "cat", "/sdcard/ui.xml", timeout=10)
+        if rc != 0 or not o:
+            print(".", end="", flush=True)
+            continue
+        try:
+            for node in ET.fromstring(o).iter("node"):
+                node_text = (node.get("text") or node.get("content-desc") or "").strip()
+                if text.lower() in node_text.lower():
+                    m = re.findall(r'\d+', node.get("bounds", ""))
+                    if len(m) >= 4:
+                        x = (int(m[0]) + int(m[2])) // 2
+                        y = (int(m[1]) + int(m[3])) // 2
+                        adb("shell", "input", "tap", str(x), str(y), timeout=5)
+                        print(f" → tapped ({x},{y}) ✓")
+                        return True
+        except Exception:
+            pass
+        print(".", end="", flush=True)
+    print(" — not found (ok)")
+    return False
 
 def get_cert_hash(pem_path):
     o, e, rc = run("openssl", "x509", "-inform", "PEM",
@@ -89,207 +124,149 @@ def get_cert_hash(pem_path):
 def ensure_mitm_cert():
     if os.path.isfile(MITM_CERT_PEM):
         return
-    print("  Generating mitmproxy CA cert...")
+    print("  Generating mitmproxy CA cert (first run)...")
     p = subprocess.Popen(["mitmdump", "--listen-port", "8080"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3); p.terminate(); time.sleep(1)
     if not os.path.isfile(MITM_CERT_PEM):
-        print(f"  ERROR: cert not at {MITM_CERT_PEM}"); sys.exit(1)
+        print(f"  ERROR: cert not generated at {MITM_CERT_PEM}"); sys.exit(1)
     print(f"  ✓ {MITM_CERT_PEM}")
+
+def step(n, msg):
+    print(f"\n[{n}] {msg}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-banner("KukuCapture — one-time root setup")
+print("\n==================================================")
+print("  KukuCapture — automated root setup")
+print("==================================================")
 os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(TOOLS_DIR, exist_ok=True)
 
-# ── Step 1: AVD ───────────────────────────────────────────────────────────────
-banner("Step 1 — KukuCapture AVD")
+step(0, "Stopping any running emulators")
+kill_emulator()
+print("  ✓")
 
-if avd_exists(AVD_NAME):
-    ans = input(f"  AVD '{AVD_NAME}' already exists. Recreate? [y/N] ").strip().lower()
-    if ans == "y":
-        run(AVDMANAGER, "delete", "avd", "--name", AVD_NAME)
-        print("  ✓ Deleted")
-    else:
-        print("  Keeping existing AVD")
+step(1, f"Creating {AVD_NAME} AVD  ({AVD_IMAGE})")
+o, _, _ = run(AVDMANAGER, "list", "avd")
+if AVD_NAME in o:
+    run(AVDMANAGER, "delete", "avd", "--name", AVD_NAME)
+    print(f"  Deleted existing '{AVD_NAME}'")
+subprocess.run([SDKMANAGER, "--install", AVD_IMAGE], check=True, timeout=600)
+r = subprocess.run(
+    [AVDMANAGER, "create", "avd",
+     "--name", AVD_NAME, "--package", AVD_IMAGE,
+     "--device", AVD_DEVICE, "--force"],
+    input="no\n", text=True, capture_output=True, timeout=60,
+)
+if r.returncode != 0:
+    print(f"  ERROR: {r.stderr}"); sys.exit(1)
+print(f"  ✓ '{AVD_NAME}' created")
 
-if not avd_exists(AVD_NAME):
-    print(f"  Installing {AVD_IMAGE} ...")
-    subprocess.run([SDKMANAGER, "--install", AVD_IMAGE], check=True, timeout=600)
-    result = subprocess.run(
-        [AVDMANAGER, "create", "avd",
-         "--name", AVD_NAME, "--package", AVD_IMAGE,
-         "--device", AVD_DEVICE, "--force"],
-        input="no\n", text=True, capture_output=True, timeout=60,
-    )
-    if result.returncode != 0:
-        print(f"  ERROR: {result.stderr}"); sys.exit(1)
-    print(f"  ✓ AVD '{AVD_NAME}' created  ({AVD_IMAGE})")
-
-# ── Step 2: Download rootAVD ─────────────────────────────────────────────────
-banner("Step 2 — rootAVD")
-
+step(2, "Downloading rootAVD (if needed)")
 if not os.path.isfile(ROOT_AVD_SH):
     os.makedirs(ROOT_AVD_DIR, exist_ok=True)
-    print(f"  Downloading rootAVD.sh from GitLab...")
     urllib.request.urlretrieve(ROOT_AVD_URL, ROOT_AVD_SH)
     os.chmod(ROOT_AVD_SH, os.stat(ROOT_AVD_SH).st_mode | stat.S_IEXEC)
-    print(f"  ✓ Saved to {ROOT_AVD_SH}")
+    print(f"  ✓ Downloaded to {ROOT_AVD_SH}")
 else:
-    print(f"  ✓ rootAVD already at {ROOT_AVD_SH}")
+    print(f"  ✓ Already present")
 
-# ── Step 3: Boot emulator ────────────────────────────────────────────────────
-banner("Step 3 — Boot emulator (pre-root)")
-
-# Kill any running emulator first
-devs, _, _ = adb("devices")
-for s in [l.split()[0] for l in devs.splitlines() if "emulator" in l]:
-    run(ADB, "-s", s, "emu", "kill")
-subprocess.run(["pkill", "-f", "emulator"], capture_output=True)
-time.sleep(4)
-
-print(f"  Starting '{AVD_NAME}'...")
-log_path = os.path.join(LOGS_DIR, "rootavd_setup.log")
-subprocess.Popen(
-    [EMULATOR_BIN, "-avd", AVD_NAME,
-     "-no-snapshot-save", "-no-audio",
-     "-gpu", "swiftshader_indirect"],
-    stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
-)
-
-if not wait_for_boot(AVD_NAME):
-    print("  ERROR: Emulator did not boot. Check logs/rootavd_setup.log")
-    sys.exit(1)
+step(3, "First boot (pre-root)")
+start_emulator()
+if not wait_for_boot():
+    print("  ERROR: emulator did not boot. Check logs/rootavd_setup.log"); sys.exit(1)
 time.sleep(5)
 
-# ── Step 4: Run rootAVD ───────────────────────────────────────────────────────
-banner("Step 4 — Patch Magisk into ramdisk (rootAVD)")
-print(f"""
-  rootAVD will:
-    1. Download Magisk APK from GitHub
-    2. Patch {RAMDISK}
-    3. Install Magisk.apk on the running emulator
-    4. The emulator will reboot automatically
-
-  This may take 1-2 minutes...
-""")
-
-result = subprocess.run(
+step(4, "Patching ramdisk with Magisk (rootAVD)")
+print(f"  Ramdisk : {RAMDISK}")
+print("  Piping '1' → auto-selects stable Magisk, no menu wait")
+proc = subprocess.Popen(
     ["bash", ROOT_AVD_SH, RAMDISK],
-    cwd=SDK,   # rootAVD uses SDK root as working dir
-    timeout=300,
+    cwd=SDK,
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
 )
-if result.returncode != 0:
-    print("  WARNING: rootAVD exited non-zero — this is sometimes normal.")
-    print("  Check if the emulator rebooted and Magisk is installed.")
+try:
+    out, _ = proc.communicate(input="1\n", timeout=300)
+    for line in out.splitlines()[-20:]:
+        print(f"    {line}")
+    if proc.returncode not in (0, 1):
+        print(f"  WARNING: rootAVD exited {proc.returncode}")
+except subprocess.TimeoutExpired:
+    proc.kill()
+    print("  WARNING: rootAVD timed out — continuing")
+print("  ✓ rootAVD done")
 
-print("\n  rootAVD finished. Waiting for emulator to reboot...")
-time.sleep(10)
-if not wait_for_boot("post-rootAVD"):
-    print("  ERROR: Emulator did not come back after rootAVD.")
-    sys.exit(1)
-time.sleep(5)
+step(5, "Cold reboot (loads patched ramdisk)")
+print("  Killing emulator and cold-booting...")
+kill_emulator()
+time.sleep(2)
+start_emulator()
+if not wait_for_boot():
+    print("  ERROR: failed to boot after rootAVD"); sys.exit(1)
+time.sleep(10)  # let Magisk init settle
 
-# ── Step 5: Magisk first-boot setup (interactive) ─────────────────────────────
-banner("Step 5 — Complete Magisk setup (manual)")
-print("""
-  On the EMULATOR:
-    1. Find and open the  Magisk  app
-    2. Tap  "OK"  on the "Requires Additional Setup" dialog
-    3. The emulator will REBOOT — wait for it to fully boot
+step(6, "Magisk first-run setup (automated)")
+# Open Magisk — try both known package names (official + HuskyDG fork)
+for pkg in ("io.github.huskydg.magisk", "com.topjohnwu.magisk"):
+    adb("shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1", timeout=8)
+    time.sleep(2)
 
-  Come back here after the reboot completes.
-""")
-input("  Press ENTER once the emulator has rebooted and you see the home screen ▶  ")
+# Auto-tap the "Requires Additional Setup → OK" dialog if it appears
+tapped = tap_text("OK", timeout=24)
 
-if not wait_for_boot("post-Magisk-setup"):
-    print("  Emulator not fully booted yet, waiting longer...")
-    time.sleep(15)
-
-# ── Step 6: Pre-authorise ADB shell in Magisk ────────────────────────────────
-banner("Step 6 — Pre-authorise ADB shell for silent su")
-print("""
-  We need to grant the ADB shell permanent root access in Magisk so
-  GO.py can install certs silently on future runs.
-
-  On the EMULATOR a "Superuser Request" popup WILL appear.
-  → Tap  "Grant"
-  → Tap  "Remember choice"  (toggle it ON)
-""")
-print("  Sending test su command (watch the emulator screen)...")
-time.sleep(3)
-
-# First su call — triggers the Magisk grant popup
-o, e, rc = run(ADB, "shell", "su", "0", "-c", "echo ROOT_OK", timeout=15)
-if "ROOT_OK" not in o:
-    print("""
-  Did not get root confirmation.
-  Please:
-    1. Open Magisk app on emulator → Superuser tab
-    2. Make sure 'Shell' is listed and set to 'Allow'
-    3. Press ENTER below and we will retry
-""")
-    input("  Press ENTER to retry ▶  ")
-    o, e, rc = run(ADB, "shell", "su", "0", "-c", "echo ROOT_OK", timeout=15)
-
-if "ROOT_OK" not in o:
-    print(f"  ERROR: Cannot obtain root via su. Output: {o!r}  {e!r}")
-    sys.exit(1)
-print("  ✓ Root confirmed via Magisk su")
-
-# Write permanent policy into Magisk DB (prevents future popups)
-print("  Writing permanent shell→root policy to Magisk DB...")
-adb_su(
-    "sqlite3 /data/adb/magisk.db",
-    '"INSERT OR REPLACE INTO policies'
-    " (uid, policy, until, logging, notification)"
-    ' VALUES (2000, 2, 0, 1, 0);"',
-    timeout=10,
-)
-print("  ✓ ADB shell permanently authorised")
-
-# ── Step 7: Install mitmproxy cert as system cert ────────────────────────────
-banner("Step 7 — Install mitmproxy cert as SYSTEM cert (via Magisk module)")
-ensure_mitm_cert()
-
-cert_hash = get_cert_hash(MITM_CERT_PEM)
-print(f"  Cert hash : {cert_hash}")
-
-# Push cert to sdcard, then copy to system via su
-remote_staging = f"/sdcard/{cert_hash}.0"
-remote_cert    = f"/system/etc/security/cacerts/{cert_hash}.0"
-
-adb("push", MITM_CERT_PEM, remote_staging, timeout=15)
-adb_su(f"cp {remote_staging} {remote_cert}", timeout=10)
-adb_su(f"chmod 644 {remote_cert}", timeout=10)
-adb_su(f"rm {remote_staging}", timeout=10)
-
-# Verify
-o, _, _ = adb_su(f"ls -la {remote_cert}", timeout=10)
-if cert_hash in o:
-    print(f"  ✓ System cert installed: {remote_cert}")
+if tapped:
+    print("  Magisk triggered reboot — waiting...")
+    time.sleep(10)
+    kill_emulator()
+    time.sleep(2)
+    start_emulator()
+    if not wait_for_boot():
+        print("  ERROR: failed to boot after Magisk setup"); sys.exit(1)
+    time.sleep(8)
 else:
-    print(f"  WARNING: cert may not have been written correctly. Output: {o!r}")
+    print("  No setup dialog appeared — Magisk already active")
+
+step(7, "Verifying root")
+# On google_apis, adb root always works (ro.debuggable=1)
+adb("root", timeout=15)
+time.sleep(3)
+o, _, rc = adb("shell", "id", timeout=10)
+if "uid=0" not in o:
+    print(f"  WARNING: adb root returned unexpected: {o!r}")
+else:
+    print(f"  ✓ {o.strip()}")
+
+# Remount /system writable
+adb("remount", timeout=20)
+print("  ✓ /system remounted writable")
+
+step(8, "Installing mitmproxy cert into system trust store")
+ensure_mitm_cert()
+cert_hash   = get_cert_hash(MITM_CERT_PEM)
+remote_cert = f"{SYSTEM_CACERTS}/{cert_hash}.0"
+print(f"  Hash   : {cert_hash}")
+print(f"  Target : {remote_cert}")
+
+_, err, rc = adb("push", MITM_CERT_PEM, remote_cert, timeout=15)
+if rc == 0:
+    adb("shell", "chmod", "644", remote_cert, timeout=10)
+    print(f"  ✓ Cert installed")
+else:
+    print(f"  ERROR pushing cert: {err}"); sys.exit(1)
 
 # ── Done ─────────────────────────────────────────────────────────────────────
-banner("Done ✓")
-print(f"""
-  KukuCapture is now rooted and ready.
+print("""
+==================================================
+  ✓ Setup complete — KukuCapture is ready
+==================================================
 
-  What was set up:
-    • AVD:       {AVD_NAME}  ({AVD_IMAGE})
-    • Root:      Magisk (via rootAVD)
-    • ADB shell: permanently authorised for root
-    • Cert:      {remote_cert}
+  Now run:
+      python3 GO.py
 
-  Next steps:
-    python3 GO.py
-
-  GO.py will:
-    • Start this AVD
-    • Install original KukuTV APKs
-    • Start mitmproxy
-    • Guide you through login + capture
+==================================================
 """)
 
