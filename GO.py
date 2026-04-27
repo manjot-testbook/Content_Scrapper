@@ -279,26 +279,40 @@ subprocess.Popen(
 time.sleep(3)
 print("  ✓ mitmproxy listening on :8080")
 
-# Proxy OFF — let you log in with OTP (Play Integrity check needs direct internet)
+# Proxy OFF — for OTP login / Play Integrity
 adb("shell", "settings", "put", "global", "http_proxy", ":0")
 adb("shell", "settings", "delete", "global", "http_proxy")
 
 print("""
 ==================================================
-  ✓ DONE — follow the steps below
+  ✓ Ready — Action required on the emulator
 ==================================================
 
- 1. Open KukuTV on the emulator
-    → Log in with your phone number + OTP
-    (proxy is OFF so OTP/Play Integrity works)
+  STEP 1: Open KukuTV on the emulator
+          → Log in with your phone number + OTP
+          (proxy is OFF so OTP / Play Integrity works)
 
- 2. After login, ENABLE the proxy:
-    """ + ADB + """ shell settings put global http_proxy 10.0.2.2:8080
+  STEP 2: Come back here and press ENTER.
+          The proxy will be enabled automatically.
+==================================================
+""")
+input("  ▶  Press ENTER once you have logged in to KukuTV: ")
 
- 3. Browse KukuTV:
-    → Home feed → tap a show → tap an episode → play video
+# Automatically enable proxy — all traffic now routes through mitmproxy
+adb("shell", "settings", "put", "global", "http_proxy", "10.0.2.2:8080")
+print("""
+==================================================
+  ✓ Proxy ON — mitmproxy is capturing traffic
+==================================================
 
- 4. Analyse captured traffic:
+  In KukuTV now:
+    → Browse the home feed
+    → Tap a show → tap an episode → play a video
+
+  Check traffic live:
+    tail -f metadata/captured_apis/api_traffic.jsonl
+
+  Analyse when done:
     python3 scripts/analyze.py
 
 ==================================================
