@@ -53,13 +53,26 @@ python3 scripts/setup_apk_downloader_avd.py
 #   3. Press Enter — APKs saved to apks/
 ```
 
-### Step 2 — Run the capture pipeline
+### Step 2 — Root the KukuCapture AVD (one time)
 
 ```bash
-# Normal run (reuses existing KukuCapture AVD if present)
+python3 scripts/root_capture_avd.py
+# Interactive — follow the on-screen prompts:
+#   1. rootAVD downloads + patches Magisk into the ramdisk
+#   2. Emulator reboots — open Magisk app → tap OK → reboot again
+#   3. Tap "Grant" on the Magisk superuser popup when prompted
+#   4. mitmproxy cert is installed into system cert store
+```
+
+This only needs to be re-run if you recreate the AVD (`python3 GO.py --scratch`).
+
+### Step 3 — Run the capture pipeline
+
+```bash
+# After root_capture_avd.py has been run once:
 python3 GO.py
 
-# Fresh start (deletes + recreates KukuCapture AVD from scratch)
+# Recreate the AVD from scratch (then re-run root_capture_avd.py):
 python3 GO.py --scratch
 ```
 
@@ -92,33 +105,30 @@ python3 GO.py --scratch
 
 ```
 Content_Scrapper/
-├── GO.py                          # Master script — start here
+├── GO.py                          # Main pipeline — run after root_capture_avd.py
 ├── requirements.txt
 │
 ├── apks/                          # Original KukuTV APKs (from setup_apk_downloader_avd.py)
-│   ├── base.apk
-│   ├── split_config.arm64_v8a.apk
-│   └── split_config.xxhdpi.apk
 │
 ├── scripts/
-│   ├── setup_apk_downloader_avd.py  # Creates Play Store AVD, installs KukuTV, pulls APKs
-│   ├── analyze.py                   # Parses api_traffic.jsonl → API catalog
-│   ├── kuku_scraper.py              # Makes direct API calls using captured session token
-│   └── pull_apks.py                 # Standalone: pull APKs from any running device
+│   ├── root_capture_avd.py        # ONE-TIME: rootAVD + Magisk setup for KukuCapture
+│   ├── setup_apk_downloader_avd.py  # ONE-TIME: get original KukuTV APKs via Play Store
+│   ├── analyze.py
+│   ├── kuku_scraper.py
+│   └── pull_apks.py
+│
+├── tools/
+│   └── rootAVD/
+│       └── rootAVD.sh             # Downloaded by root_capture_avd.py automatically
 │
 ├── mitm_addons/
-│   └── mitm_addon.py              # mitmproxy addon: logs all traffic to JSONL
+│   └── mitm_addon.py
 │
-├── metadata/
-│   ├── captured_apis/
-│   │   └── api_traffic.jsonl      # Raw captured traffic (written by mitm_addon.py)
-│   └── api_catalog/
-│       └── all_series.json
+├── metadata/captured_apis/
+│   └── api_traffic.jsonl
 │
-├── build/                         # Working dir for patching/signing (gitignored)
+├── build/                         # Gitignored working dir
 └── logs/
-    ├── emulator.log
-    └── mitm.log
 ```
 
 ---
@@ -128,9 +138,10 @@ Content_Scrapper/
 | AVD | Image | Root | Purpose |
 |---|---|---|---|
 | `apk_downloader_avd` | `google_apis_playstore` | ❌ | Has Play Store — used to download original KukuTV APKs |
-| `KukuCapture` | `google_apis` | ✅ | Rootable — used to intercept traffic with system cert |
+| `KukuCapture` | `google_apis_playstore` + **Magisk** | ✅ | Full Play Services + root — used to intercept traffic |
 
-You can't use one for both: Play Store images block root; rootable images have no Play Store.
+Both use `google_apis_playstore` because KukuTV checks for working Play Services at startup.  
+`KukuCapture` gets root via **rootAVD** (Magisk patched into the ramdisk) — this is a one-time setup.
 
 ---
 
@@ -157,8 +168,24 @@ Install mitmproxy CA cert via Android Settings → Security (no root needed).
 
 **Fails because:** KukuTV's NSC is `<certificates src="system"/>` only. User certs are in a different store and are completely ignored.
 
+### Approach D — google_apis without rootAVD/Magisk
+Use the `google_apis` debug image with just `adb root` (no full Magisk).
+
+**Fails because:** `google_apis` has a stripped GMS stub. `GmsCoreStatsService` crashes on boot. KukuTV's startup check `isGooglePlayServiceAvailable()` returns false → shows "Something went wrong, Check that Google Play is enabled" dialog and blocks login.
+
+Logcat signature:
+```
+W ActivityManager: Scheduling restart of crashed service com.google.android.gms/.common.stats.GmsCoreStatsService
+D StrictMode: StrictMode policy violation: BugleSurveyCommonConditions.isGooglePlayServiceAvailable
+```
+
 ### ✅ Working Solution
-`google_apis` AVD + `-writable-system` + `adb root` + push cert to system store + **original APK untouched**.
+`google_apis_playstore` AVD + **rootAVD** (Magisk) + push cert via `su -c` + **original APK untouched**.
+
+- Full Play Services → KukuTV GMS checks pass
+- Magisk gives root on a production-build image
+- Original APK → Pairip happy
+- System cert → mitmproxy trusted
 
 ---
 
@@ -192,11 +219,12 @@ with open('metadata/captured_apis/api_traffic.jsonl') as f:
 
 | Problem | Solution |
 |---|---|
-| App opens and immediately closes | APK was tampered (Pairip). Use `python3 GO.py --scratch` to reinstall original APK |
+| App opens and immediately closes | APK was tampered (Pairip). Use `python3 GO.py --scratch` then `root_capture_avd.py` |
+| "Something went wrong / Check Google Play" | GMS not working — run `python3 scripts/root_capture_avd.py` (uses `google_apis_playstore`) |
 | No traffic in api_traffic.jsonl | Proxy not enabled after login — run the `settings put` command above |
-| `adb: device offline` after root | `adb root` restarts adbd — wait 3s and retry |
-| `adb remount` fails | Emulator not started with `-writable-system` — use `GO.py` which adds this flag |
+| `ERROR: Magisk is not installed` | Run `python3 scripts/root_capture_avd.py` first |
+| `Cannot get root via Magisk su` | Open Magisk app → Superuser → grant Shell, or re-run `root_capture_avd.py` |
 | `adb: no devices` | Start emulator first, or run `python3 GO.py` |
-| TLS handshake failed in mitm.log | System cert not pushed — re-run `python3 GO.py --scratch` |
+| TLS handshake failed in mitm.log | System cert not pushed — re-run `root_capture_avd.py` |
 | `mitmproxy-ca-cert.pem` missing | GO.py generates it automatically on first run |
 | 401 on API calls | Token expired — re-run capture to get fresh session |
