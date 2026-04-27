@@ -1,78 +1,89 @@
 # KukuTV Content Scraper
 
-> **For testing & QA purposes only.** Built to help testers at Kuku understand what data the app exposes via its backend APIs.
-
-## Overview
-
-This toolkit:
-1. **Intercepts API traffic** from the KukuTV Android app using `mitmproxy`
-2. **Navigates the app** automatically via `Appium` to trigger all API endpoints
-3. **Bypasses SSL pinning** (if present) using `Frida`
-4. **Analyzes** the captured endpoints and video URLs
-5. **Downloads** video/audio content using `ffmpeg` / `yt-dlp`
+> **For testing & QA purposes only.**
 
 ---
 
-## Prerequisites
+## How It Works (The Short Version)
 
-### macOS host
-```bash
-brew install ffmpeg
-pip install -r requirements.txt
-# Install Appium server
-npm install -g appium
-appium driver install uiautomator2
-```
+Modern apps use HTTPS + certificate pinning to prevent traffic inspection.
+KukuTV uses **Pairip** (anti-tamper) + **NSC** (only trusts system certs).
 
-### Android Emulator (Android Studio)
-- Create an AVD with **Google Play Store** (Pixel 6, API 33+)
-- Start the emulator from Android Studio
-- Log in with a Google account and **install KukuTV from Play Store** (`com.vlv.aravali.reels`)
+Two approaches were tried — one failed, one works:
 
-### mitmproxy CA Certificate (one-time)
-```bash
-# Generate the cert (run once)
-mitmdump --listen-port 8080 &
-sleep 2 && kill %1
+| Approach | Result | Why |
+|---|---|---|
+| Patch APK (inject NSC) + resign | ❌ Crash on launch | Pairip detects signature mismatch → `SIGABRT` |
+| Original APK + system cert | ✅ Works | Pairip sees original signature; mitmproxy cert is in system store |
 
-# Push cert to emulator
-adb push ~/.mitmproxy/mitmproxy-ca-cert.cer /sdcard/Download/
-# On emulator: Settings → Security → Encryption & credentials → Install a certificate → CA Certificate
-```
+**The working approach:**
+1. Use a `google_apis` AVD (rootable — `adb root` works)
+2. Start emulator with `-writable-system`
+3. `adb root` → `adb remount` → push mitmproxy CA cert to `/system/etc/security/cacerts/`
+4. Install **original unmodified** APKs from the Play Store
+5. Pairip is happy (original signature) + mitmproxy is trusted (system cert)
 
 ---
 
 ## Quick Start
 
+### Prerequisites
+
 ```bash
-# Check emulator + app status
-./run.sh status
+# macOS host
+brew install ffmpeg mitmproxy
+pip install -r requirements.txt
 
-# Full pipeline: proxy + navigate + analyze + download
-./run.sh all
-
-# Individual steps
-./run.sh proxy        # Start mitmproxy + configure emulator proxy
-./run.sh navigate     # Appium automation (needs: appium --port 4723)
-./run.sh analyze      # Parse captured traffic → API catalog
-./run.sh scrape       # Download discovered videos
-./run.sh stop         # Stop proxy, clear device proxy setting
+# Android SDK: install via Android Studio
+# Required SDK components:
+#   platform-tools, emulator, build-tools, cmdline-tools
+#   system-images;android-33;google_apis;arm64-v8a         ← capture AVD (rootable)
+#   system-images;android-33;google_apis_playstore;arm64-v8a ← APK download AVD
 ```
 
-### If app has SSL pinning (no traffic captured)
-```bash
-# Option A: Frida (requires rooted emulator + frida-server on device)
-adb push frida-server /data/local/tmp/
-adb shell chmod +x /data/local/tmp/frida-server
-adb shell "/data/local/tmp/frida-server &"
-./run.sh bypass --spawn &
-./run.sh capture
+### Step 1 — Get KukuTV APKs (one time)
 
-# Option B: objection (easier)
-pip install objection
-objection -g com.vlv.aravali.reels explore
-# Then inside objection shell:
-android sslpinning disable
+Creates a separate Play Store AVD, lets you install KukuTV, pulls the APKs:
+
+```bash
+python3 scripts/setup_apk_downloader_avd.py
+# Follow the interactive prompts:
+#   1. Sign in to Play Store on the emulator
+#   2. Install KukuTV
+#   3. Press Enter — APKs saved to apks/
+```
+
+### Step 2 — Run the capture pipeline
+
+```bash
+# Normal run (reuses existing KukuCapture AVD if present)
+python3 GO.py
+
+# Fresh start (deletes + recreates KukuCapture AVD from scratch)
+python3 GO.py --scratch
+```
+
+`GO.py` will:
+1. Start the `KukuCapture` AVD with `-writable-system`
+2. `adb root` + `adb remount`
+3. Push mitmproxy CA cert into `/system/etc/security/cacerts/`
+4. Install original KukuTV APKs (untouched)
+5. Start `mitmdump` → logs all traffic to `metadata/captured_apis/api_traffic.jsonl`
+6. Turn proxy **OFF** (so OTP login works)
+
+### Step 3 — Log in + capture
+
+```
+1. KukuTV opens on emulator → log in with OTP
+   (proxy is OFF so Play Integrity / OTP auth works cleanly)
+
+2. After login, turn proxy ON:
+   ~/Library/Android/sdk/platform-tools/adb shell settings put global http_proxy 10.0.2.2:8080
+
+3. Browse: Home → pick a show → play an episode
+
+4. Analyse:
+   python3 scripts/analyze.py
 ```
 
 ---
@@ -81,81 +92,98 @@ android sslpinning disable
 
 ```
 Content_Scrapper/
-├── run.sh                        # Master script — start here
+├── GO.py                          # Master script — start here
 ├── requirements.txt
 │
-├── mitm_addons/
-│   ├── mitm_addon.py             # mitmproxy addon: logs all traffic to JSONL
-│   └── frida_ssl_bypass.js       # Frida script: disables SSL/TLS pinning
+├── apks/                          # Original KukuTV APKs (from setup_apk_downloader_avd.py)
+│   ├── base.apk
+│   ├── split_config.arm64_v8a.apk
+│   └── split_config.xxhdpi.apk
 │
 ├── scripts/
-│   ├── capture_pipeline.py       # Full pipeline: proxy → launch → capture
-│   ├── appium_navigator.py       # Appium automation: navigates app screens
-│   ├── bypass_ssl_pinning.py     # Python wrapper for Frida bypass
-│   ├── analyze_apis.py           # Parses JSONL → API endpoint catalog
-│   ├── quick_analyze.py          # Fast traffic summary
-│   ├── scraper.py                # Downloads videos from discovered URLs
-│   ├── start_proxy.py            # Standalone proxy launcher
-│   └── install_apkm.py           # Install split APK from .apkm file
+│   ├── setup_apk_downloader_avd.py  # Creates Play Store AVD, installs KukuTV, pulls APKs
+│   ├── analyze.py                   # Parses api_traffic.jsonl → API catalog
+│   ├── kuku_scraper.py              # Makes direct API calls using captured session token
+│   └── pull_apks.py                 # Standalone: pull APKs from any running device
+│
+├── mitm_addons/
+│   └── mitm_addon.py              # mitmproxy addon: logs all traffic to JSONL
 │
 ├── metadata/
 │   ├── captured_apis/
-│   │   └── api_traffic.jsonl     # Raw captured traffic (one JSON per line)
+│   │   └── api_traffic.jsonl      # Raw captured traffic (written by mitm_addon.py)
 │   └── api_catalog/
-│       └── api_catalog.json      # Parsed API endpoint catalog
+│       └── all_series.json
 │
-├── videos/                       # Downloaded video files
+├── build/                         # Working dir for patching/signing (gitignored)
 └── logs/
-    ├── mitm.log                  # mitmproxy output
-    └── traffic_summary.json      # Quick analysis output
+    ├── emulator.log
+    └── mitm.log
 ```
 
 ---
 
-## How It Works
+## Two AVDs — Why Both Exist
 
-### Step 1 — Traffic Capture
-`mitm_addon.py` intercepts every HTTP(S) request/response and writes structured records to `metadata/captured_apis/api_traffic.jsonl`:
+| AVD | Image | Root | Purpose |
+|---|---|---|---|
+| `apk_downloader_avd` | `google_apis_playstore` | ❌ | Has Play Store — used to download original KukuTV APKs |
+| `KukuCapture` | `google_apis` | ✅ | Rootable — used to intercept traffic with system cert |
 
-```json
-{
-  "method": "GET",
-  "url": "https://api.kukutv.com/v2/content/home",
-  "host": "api.kukutv.com",
-  "path": "/v2/content/home",
-  "status_code": 200,
-  "response_body": { "shows": [...] },
-  "request_headers": { "Authorization": "Bearer eyJ..." },
-  "is_kukutv": true
-}
+You can't use one for both: Play Store images block root; rootable images have no Play Store.
+
+---
+
+## What Failed (and Why)
+
+### Approach A — Patch APK (NSC inject + resign)
+Edit `res/xml/network_security_config.xml` inside `base.apk` to also trust user certs, resign with debug key, install.
+
+**Fails because:** KukuTV ships with `libpairipcore.so` (Pairip SDK). At startup it reads the APK's signing certificate and compares it to the expected Play Store cert. Any mismatch → `SIGABRT` before the app even shows a screen.
+
+Logcat signature:
+```
+F DEBUG   : #00 pc 0000000000037cbc  .../split_config.arm64_v8a.apk!libpairipcore.so
+E ActivityManager: App crashed on incremental package com.vlv.aravali.reels
 ```
 
-### Step 2 — API Analysis
-`analyze_apis.py` parses the JSONL and produces `metadata/api_catalog/api_catalog.json`:
-- All unique endpoints with method, host, path
-- Auth headers (tokens, API keys)
-- Video/stream URLs (`.m3u8`, `.mp4`, `.mpd`)
-- Sample responses
+### Approach B — MicroG on google_apis
+Replace GMS stub on the rootable image with MicroG so KukuTV gets Play Services.
 
-### Step 3 — Video Download
-`scraper.py` reads the catalog and downloads:
-- HLS streams (`.m3u8`) → `ffmpeg`
-- DASH streams (`.mpd`) → `yt-dlp`
-- Direct MP4/MP3 → `httpx` streaming
+**Fails because:** Android's package manager refuses to install an APK signed with a different certificate over an existing system app. MicroG's cert ≠ Google's stub cert → `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Various workarounds (tmpfs overlay, editing `packages.xml`) either don't survive reboot or cause `Can't find service: package` framework crashes.
+
+### Approach C — User cert only
+Install mitmproxy CA cert via Android Settings → Security (no root needed).
+
+**Fails because:** KukuTV's NSC is `<certificates src="system"/>` only. User certs are in a different store and are completely ignored.
+
+### ✅ Working Solution
+`google_apis` AVD + `-writable-system` + `adb root` + push cert to system store + **original APK untouched**.
 
 ---
 
 ## Manual Commands
 
 ```bash
-# Download a specific video URL
-python scripts/scraper.py --url "https://cdn.example.com/episode.m3u8" --output videos/ep.mp4
+# Check a specific API endpoint with the captured token
+python3 scripts/kuku_scraper.py --home
 
-# Analyze traffic without running the full pipeline
-python scripts/analyze_apis.py
+# Re-run analysis without re-capturing
+python3 scripts/analyze.py
 
-# Quick summary
-python scripts/quick_analyze.py && cat logs/traffic_summary.json | python -m json.tool
+# Enable/disable proxy manually
+adb shell settings put global http_proxy 10.0.2.2:8080   # ON
+adb shell settings delete global http_proxy               # OFF
+
+# Check what's in the captured traffic
+python3 -c "
+import json
+with open('metadata/captured_apis/api_traffic.jsonl') as f:
+    for line in f:
+        d = json.loads(line)
+        if d.get('is_kuku'):
+            print(d['method'], d['url'][:80])
+"
 ```
 
 ---
@@ -163,10 +191,12 @@ python scripts/quick_analyze.py && cat logs/traffic_summary.json | python -m jso
 ## Troubleshooting
 
 | Problem | Solution |
-|---------|----------|
-| No traffic captured | App uses SSL pinning → run `./run.sh bypass` |
-| `adb: no devices` | Start Android emulator first |
-| Appium connection refused | Run `appium --port 4723` in a separate terminal |
-| `ffmpeg not found` | `brew install ffmpeg` |
-| TLS handshake failed in `mitm.log` | Install mitmproxy CA cert on emulator (see Prerequisites) |
-| 401 errors on API calls | Auth token expired — re-run capture to get fresh token |
+|---|---|
+| App opens and immediately closes | APK was tampered (Pairip). Use `python3 GO.py --scratch` to reinstall original APK |
+| No traffic in api_traffic.jsonl | Proxy not enabled after login — run the `settings put` command above |
+| `adb: device offline` after root | `adb root` restarts adbd — wait 3s and retry |
+| `adb remount` fails | Emulator not started with `-writable-system` — use `GO.py` which adds this flag |
+| `adb: no devices` | Start emulator first, or run `python3 GO.py` |
+| TLS handshake failed in mitm.log | System cert not pushed — re-run `python3 GO.py --scratch` |
+| `mitmproxy-ca-cert.pem` missing | GO.py generates it automatically on first run |
+| 401 on API calls | Token expired — re-run capture to get fresh session |
