@@ -298,8 +298,12 @@ print("""
 """)
 input("  ▶  Press ENTER once you have logged in to KukuTV: ")
 
-# Automatically enable proxy — all traffic now routes through mitmproxy
+# Enable proxy — all traffic now routes through mitmproxy
 adb("shell", "settings", "put", "global", "http_proxy", "10.0.2.2:8080")
+# Force-restart KukuTV so it picks up the new proxy immediately
+adb("shell", "am", "force-stop", PACKAGE, timeout=10)
+time.sleep(2)
+adb("shell", "monkey", "-p", PACKAGE, "-c", "android.intent.category.LAUNCHER", "1", timeout=10)
 print("""
 ==================================================
   ✓ Proxy ON — mitmproxy is capturing traffic
