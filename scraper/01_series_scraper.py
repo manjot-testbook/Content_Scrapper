@@ -3,13 +3,21 @@ Script 1 — KukuFM All-Series Scraper
 ======================================
 Discovers every show in the KukuFM catalogue from **multiple sources**:
 
-  1. Home feed  (/api/v3/home/all/)  — all language variants
+  1. Home feed  (/api/v3/home/all/?selected_tab={tab}&page=N)  — all 4 tabs, all pages
   2. Home category "more shows" pages  (/api/v3/home/category_more_shows)
   3. Trending  (/api/v1.0/channels/trending/)
   4. Search recommendations  (/api/v2/search/recommendations/)
   5. "More like this" fan-out from seed shows  (/api/v2/groups/more-like-this/shows/)
   6. Library / watch-history items  (/api/v3.1/library/items/)
   7. Full show-details enrichment  (/api/v1.2/channels/{id}/details/)
+
+Response structure (verified from mitmproxy):
+  GET /api/v3/home/all/?selected_tab=popular&page=N
+    → {items: [{slug, view_type, title, items: [{show: {id, title, ...}}, ...]}],
+       has_more, next_page_num, total_pages, nav_bar_items}
+
+  GET /api/v1.2/channels/{id}/details/
+    → {show: {id, slug, title, ...}}
 
 Output
 ------
@@ -18,14 +26,16 @@ Output
 Run
 ---
     python scraper/01_series_scraper.py
-    python scraper/01_series_scraper.py --langs english hindi --max-pages 20 --out metadata/api_catalog/all_series.json
+    python scraper/01_series_scraper.py --max-pages 200 --out metadata/api_catalog/all_series.json
 """
 
 import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import local as thread_local
 
 import requests
 
@@ -41,11 +51,8 @@ API_BASE    = "https://api.kukufm.com"
 
 CATALOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Language slugs used for home feed pagination
-ALL_LANGS = [
-    "all", "english", "hindi", "tamil", "telugu", "kannada",
-    "malayalam", "marathi", "bengali", "gujarati", "punjabi", "odia",
-]
+# Home feed tabs (from nav_bar_items in real API response)
+HOME_TABS = ["popular", "new-hot", "originals", "ranking"]
 
 # Category slugs discovered in home feed (augmented at runtime)
 KNOWN_CATEGORY_SLUGS: list[str] = []
@@ -53,10 +60,18 @@ KNOWN_CATEGORY_SLUGS: list[str] = []
 
 # ── HTTP helpers ───────────────────────────────────────────────────────────────
 
+_thread_local = thread_local()
+
 def build_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(get_auth_headers())
     return s
+
+def get_thread_session() -> requests.Session:
+    """Return a per-thread requests.Session (thread-safe)."""
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = build_session()
+    return _thread_local.session
 
 
 def safe_get(session: requests.Session, url: str, params: dict | None = None,
@@ -82,77 +97,126 @@ def safe_get(session: requests.Session, url: str, params: dict | None = None,
 # ── Extractors ─────────────────────────────────────────────────────────────────
 
 def _extract_shows_from_section(section: dict) -> list[dict]:
-    """Pull show objects from a home-feed section."""
+    """Pull show objects from a home-feed section.
+
+    Real API structure (verified from mitmproxy):
+      section.items[i] = {uri, image, slug, metadata, show: {id, title, ...}, ...}
+    Shows are nested at item['show']. Falls back to item itself if it has 'id'.
+    """
     shows = []
-    for key in ("channels", "shows", "items", "data"):
-        items = section.get(key, [])
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict) and item.get("id"):
-                    shows.append(item)
+    for item in section.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        # Primary: show is nested at item['show']
+        show = item.get("show")
+        if isinstance(show, dict) and show.get("id"):
+            shows.append(show)
+        # Fallback: item itself is a show (older API responses)
+        elif item.get("id"):
+            shows.append(item)
     return shows
 
 
 def _extract_shows_from_home_response(data: dict) -> tuple[list[dict], list[str]]:
-    """Returns (shows, category_slugs) from a /home/ response."""
+    """Returns (shows, category_titles) from a /home/all/ response.
+
+    Real structure: {items: [sections], has_more, total_pages, ...}
+    Also collects section titles for use as show_category in category_more_shows.
+    """
     shows: list[dict] = []
-    slugs: list[str] = []
-    sections = data.get("data", data) if isinstance(data, dict) else data
+    category_titles: list[str] = []
+
+    sections = data.get("items", [])
     if not isinstance(sections, list):
-        sections = [sections]
+        # older structure fallback
+        sections = data.get("data", [])
+    if not isinstance(sections, list):
+        sections = [data]
+
     for section in sections:
         if not isinstance(section, dict):
             continue
-        slug = section.get("slug") or section.get("id")
-        if slug:
-            slugs.append(str(slug))
+        title = section.get("title", "")
+        if title and title not in ("Banner", "Continue Watching", "More Shows"):
+            category_titles.append(title)
         shows.extend(_extract_shows_from_section(section))
-    return shows, slugs
+    return shows, category_titles
 
 
 # ── Source 1 — Home feed ───────────────────────────────────────────────────────
 
-def scrape_home_feed(session: requests.Session, langs: list[str]) -> list[dict]:
+def scrape_home_feed(session: requests.Session, max_pages: int = 200) -> list[dict]:
+    """Paginate all 4 home tabs. Popular tab alone has ~139 pages.
+
+    URL: GET /api/v3/home/all/?selected_tab={tab}&page=N
+    Response: {items: [...sections...], has_more, next_page_num, total_pages}
+    """
     shows: list[dict] = []
-    for lang in langs:
-        url = f"{API_BASE}/api/v3/home/{lang}/"
-        print(f"  [home] {lang} …")
-        data = safe_get(session, url)
-        if not data:
-            continue
-        found, slugs = _extract_shows_from_home_response(data)
-        shows.extend(found)
-        KNOWN_CATEGORY_SLUGS.extend(s for s in slugs if s not in KNOWN_CATEGORY_SLUGS)
-        print(f"    → {len(found)} shows, {len(slugs)} category slugs")
-        time.sleep(0.3)
+    for tab in HOME_TABS:
+        print(f"  [home:{tab}] …")
+        page = 1
+        tab_total = None
+        while page <= max_pages:
+            params = {"page": page}
+            if tab != "popular" or page > 1:
+                params["selected_tab"] = tab
+            data = safe_get(session, f"{API_BASE}/api/v3/home/all/", params=params)
+            if not data:
+                break
+            if tab_total is None:
+                tab_total = data.get("total_pages", "?")
+                print(f"    total_pages={tab_total}")
+            batch, categories = _extract_shows_from_home_response(data)
+            shows.extend(batch)
+            for cat in categories:
+                if cat not in KNOWN_CATEGORY_SLUGS:
+                    KNOWN_CATEGORY_SLUGS.append(cat)
+            if page % 20 == 0:
+                print(f"    … page {page}/{tab_total}, shows so far: {len(shows)}")
+            if not data.get("has_more"):
+                break
+            page = data.get("next_page_num", page + 1)
+            time.sleep(0.15)
+        print(f"    ✓ [{tab}] done — collected {len(shows)} shows total, "
+              f"{len(KNOWN_CATEGORY_SLUGS)} categories")
     return shows
 
 
 # ── Source 2 — Category "more shows" pages ─────────────────────────────────────
 
 def scrape_category_more_shows(session: requests.Session,
-                                category_slugs: list[str],
+                                category_titles: list[str],
                                 max_pages: int = 10) -> list[dict]:
+    """Fetch paginated shows for each discovered category section.
+
+    URL: GET /api/v3/home/category_more_shows?show_category={title}&selected_tab={tab}&page=N&size=10
+    """
     shows: list[dict] = []
-    seen_slugs: set[str] = set()
-    for slug in category_slugs:
-        if slug in seen_slugs:
+    seen: set[str] = set()
+    for title in category_titles:
+        if title in seen:
             continue
-        seen_slugs.add(slug)
-        for page in range(1, max_pages + 1):
-            url = f"{API_BASE}/api/v3/home/category_more_shows"
-            params = {"slug": slug, "page": page}
-            data = safe_get(session, url, params=params)
-            if not data:
-                break
-            batch, _ = _extract_shows_from_home_response(data)
-            if not batch:
-                break
-            shows.extend(batch)
-            print(f"    [cat:{slug} p{page}] +{len(batch)} shows")
-            if not data.get("has_more_pages", len(batch) >= 10):
-                break
-            time.sleep(0.2)
+        seen.add(title)
+        for tab in ("popular", "ranking"):
+            for page in range(1, max_pages + 1):
+                params = {
+                    "show_category": title,
+                    "selected_tab":  tab,
+                    "page":          page,
+                    "size":          10,
+                }
+                data = safe_get(session, f"{API_BASE}/api/v3/home/category_more_shows",
+                                params=params)
+                if not data:
+                    break
+                batch, _ = _extract_shows_from_home_response(data)
+                if not batch:
+                    break
+                shows.extend(batch)
+                print(f"    [cat:{title!r} {tab} p{page}] +{len(batch)}")
+                if not data.get("has_more") and not data.get("has_more_pages"):
+                    break
+                time.sleep(0.2)
     return shows
 
 
@@ -248,11 +312,16 @@ def scrape_library(session: requests.Session) -> list[dict]:
 # ── Source 7 — Full show details enrichment ───────────────────────────────────
 
 def enrich_show_details(session: requests.Session, show_id: int) -> dict | None:
+    """GET /api/v1.2/channels/{id}/details/ → {show: {...}}"""
     url = f"{API_BASE}/api/v1.2/channels/{show_id}/details/"
-    data = safe_get(session, url)
+    data = safe_get(session, url, params={"lang": "english"})
     if not data:
         return None
-    return data.get("data", {}).get("channel") or data.get("channel") or data.get("data")
+    # Real response: {"show": {...}} — not {"data": {"channel": ...}}
+    return (data.get("show")
+            or data.get("data", {}).get("channel")
+            or data.get("channel")
+            or data.get("data"))
 
 
 # ── Deduplicate helpers ────────────────────────────────────────────────────────
@@ -330,14 +399,12 @@ def _normalize_show(show: dict) -> dict:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def run(langs: list[str] = None,
+def run(max_home_pages: int = 200,
         max_cat_pages: int = 10,
         max_mlt_seeds: int = 30,
         enrich: bool = True,
+        enrich_workers: int = 10,
         out: Path = OUT_FILE):
-
-    if langs is None:
-        langs = ALL_LANGS
 
     # Ensure we have a token
     refresh_token_without_otp()
@@ -345,9 +412,9 @@ def run(langs: list[str] = None,
 
     raw_shows: list[dict] = []
 
-    # --- Source 1: Home feeds ---
+    # --- Source 1: Home feeds (all tabs, all pages) ---
     print("\n[1/6] Home feed …")
-    raw_shows.extend(scrape_home_feed(session, langs))
+    raw_shows.extend(scrape_home_feed(session, max_pages=max_home_pages))
 
     # --- Source 2: Category pages ---
     print("\n[2/6] Category more-shows pages …")
@@ -378,19 +445,28 @@ def run(langs: list[str] = None,
 
     print(f"\n  Total unique shows collected: {len(merged)}")
 
-    # --- Enrich with full show details ---
+    # --- Enrich with full show details (parallel) ---
     if enrich:
-        print(f"\n[enrich] Fetching full details for {len(merged)} shows …")
+        print(f"\n[enrich] Fetching full details for {len(merged)} shows "
+              f"with {enrich_workers} workers …")
         enriched: dict[int, dict] = {}
-        for idx, (sid, show) in enumerate(merged.items(), 1):
-            detail = enrich_show_details(session, sid)
-            if detail:
-                enriched[sid] = detail
-            else:
-                enriched[sid] = show
-            if idx % 50 == 0:
-                print(f"  … {idx}/{len(merged)} enriched")
-            time.sleep(0.15)
+
+        def _enrich_one(sid_show):
+            sid, show = sid_show
+            sess = get_thread_session()
+            detail = enrich_show_details(sess, sid)
+            return sid, detail if detail else show
+
+        with ThreadPoolExecutor(max_workers=enrich_workers) as pool:
+            futures = {pool.submit(_enrich_one, item): item[0]
+                       for item in merged.items()}
+            done = 0
+            for future in as_completed(futures):
+                sid, result = future.result()
+                enriched[sid] = result
+                done += 1
+                if done % 50 == 0:
+                    print(f"  … {done}/{len(merged)} enriched")
         merged = enriched
 
     # --- Normalize + save ---
@@ -409,23 +485,26 @@ def run(langs: list[str] = None,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Scrape all KukuFM series")
-    ap.add_argument("--langs",      nargs="*", default=None,
-                    help="Language slugs to crawl (default: all)")
-    ap.add_argument("--max-pages",  type=int, default=10,
-                    help="Max pages per category (default 10)")
+    ap.add_argument("--max-pages",  type=int, default=200,
+                    help="Max home feed pages per tab (default 200; popular has ~139)")
+    ap.add_argument("--max-cat",    type=int, default=10,
+                    help="Max pages per category in category_more_shows")
     ap.add_argument("--max-seeds",  type=int, default=30,
                     help="Max seed shows for more-like-this fan-out")
     ap.add_argument("--no-enrich",  action="store_true",
                     help="Skip enriching every show with /details/")
+    ap.add_argument("--enrich-workers", type=int, default=10,
+                    help="Parallel threads for enrich phase (default 10)")
     ap.add_argument("--out",        default=str(OUT_FILE),
                     help="Output JSON path")
     args = ap.parse_args()
 
     run(
-        langs=args.langs,
-        max_cat_pages=args.max_pages,
+        max_home_pages=args.max_pages,
+        max_cat_pages=args.max_cat,
         max_mlt_seeds=args.max_seeds,
         enrich=not args.no_enrich,
+        enrich_workers=args.enrich_workers,
         out=Path(args.out),
     )
 
