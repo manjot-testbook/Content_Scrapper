@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .idea/
 videos/
+build/
 logs/
 metadata/captured_apis/
 metadata/api_catalog/
