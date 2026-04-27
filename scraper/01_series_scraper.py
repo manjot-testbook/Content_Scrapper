@@ -33,11 +33,39 @@ import argparse
 import json
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import local as thread_local
 
 import requests
+
+# Force line-buffered stdout so output appears immediately even when piped
+sys.stdout.reconfigure(line_buffering=True)
+
+
+# ── Global rate limiter ────────────────────────────────────────────────────────
+# Caps ALL API calls (across all threads) to MAX_RPS requests per second.
+# This is the single fix that prevents 429s — no matter how many workers run.
+
+MAX_RPS = 1.5   # requests per second (adjust down to 1.0 if still hitting limits)
+
+class _RateLimiter:
+    """Token-bucket rate limiter, thread-safe."""
+    def __init__(self, rps: float):
+        self._interval = 1.0 / rps
+        self._lock     = threading.Lock()
+        self._last     = 0.0
+
+    def wait(self):
+        with self._lock:
+            now  = time.monotonic()
+            gap  = self._interval - (now - self._last)
+            if gap > 0:
+                time.sleep(gap)
+            self._last = time.monotonic()
+
+_RL = _RateLimiter(MAX_RPS)
 
 # ── project imports ────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -75,22 +103,45 @@ def get_thread_session() -> requests.Session:
 
 
 def safe_get(session: requests.Session, url: str, params: dict | None = None,
-             retries: int = 3, backoff: float = 2.0) -> dict | None:
+             retries: int = 8) -> dict | None:
+    """
+    Rate-limited GET with exponential backoff on 429 / 5xx.
+
+    Every call goes through the global _RateLimiter (MAX_RPS), so even
+    10 parallel enrich-workers can never exceed the API rate cap.
+    On 429 we also respect the Retry-After header if present.
+    """
     for attempt in range(retries):
+        _RL.wait()          # ← global rate gate (all threads share this)
         try:
             r = session.get(url, params=params, timeout=20)
+
             if r.status_code == 429:
-                wait = backoff * (attempt + 1) * 3
-                print(f"  [rate-limit] sleeping {wait:.0f}s …")
+                # Honour Retry-After if server sends it, else exponential
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else min(10 * (2 ** attempt), 120)
+                print(f"  [429] attempt {attempt+1}/{retries} — wait {wait:.0f}s …", flush=True)
                 time.sleep(wait)
                 continue
+
+            if r.status_code in (500, 502, 503, 504):
+                wait = 2 * (attempt + 1)
+                print(f"  [HTTP {r.status_code}] retry in {wait:.0f}s …", flush=True)
+                time.sleep(wait)
+                continue
+
             if not r.ok:
-                print(f"  [HTTP {r.status_code}] {url}")
+                print(f"  [HTTP {r.status_code}] {url}", flush=True)
                 return None
+
             return r.json()
+
         except Exception as exc:
-            print(f"  [error] {exc} (attempt {attempt+1})")
-            time.sleep(backoff)
+            wait = 2 * (attempt + 1)
+            print(f"  [error] {exc} — retry in {wait:.0f}s", flush=True)
+            time.sleep(wait)
+
+    print(f"  [failed] gave up after {retries} attempts: {url}", flush=True)
     return None
 
 
@@ -153,7 +204,7 @@ def scrape_home_feed(session: requests.Session, max_pages: int = 200) -> list[di
     """
     shows: list[dict] = []
     for tab in HOME_TABS:
-        print(f"  [home:{tab}] …")
+        print(f"  [home:{tab}] …", flush=True)
         page = 1
         tab_total = None
         while page <= max_pages:
@@ -165,20 +216,20 @@ def scrape_home_feed(session: requests.Session, max_pages: int = 200) -> list[di
                 break
             if tab_total is None:
                 tab_total = data.get("total_pages", "?")
-                print(f"    total_pages={tab_total}")
+                print(f"    total_pages={tab_total}", flush=True)
             batch, categories = _extract_shows_from_home_response(data)
             shows.extend(batch)
             for cat in categories:
                 if cat not in KNOWN_CATEGORY_SLUGS:
                     KNOWN_CATEGORY_SLUGS.append(cat)
             if page % 20 == 0:
-                print(f"    … page {page}/{tab_total}, shows so far: {len(shows)}")
+                print(f"    … page {page}/{tab_total}, shows so far: {len(shows)}", flush=True)
             if not data.get("has_more"):
                 break
             page = data.get("next_page_num", page + 1)
-            time.sleep(0.15)
+            # no explicit sleep — _RateLimiter handles pacing
         print(f"    ✓ [{tab}] done — collected {len(shows)} shows total, "
-              f"{len(KNOWN_CATEGORY_SLUGS)} categories")
+              f"{len(KNOWN_CATEGORY_SLUGS)} categories", flush=True)
     return shows
 
 
@@ -216,7 +267,7 @@ def scrape_category_more_shows(session: requests.Session,
                 print(f"    [cat:{title!r} {tab} p{page}] +{len(batch)}")
                 if not data.get("has_more") and not data.get("has_more_pages"):
                     break
-                time.sleep(0.2)
+                # no explicit sleep — _RateLimiter handles pacing
     return shows
 
 
@@ -281,13 +332,12 @@ def scrape_more_like_this(session: requests.Session, seed_ids: list[int],
     for show_id in seed_ids[:30]:   # cap to avoid infinite fan-out
         data = safe_get(session, url, params={"show_id": show_id})
         if not data:
-            time.sleep(0.3)
             continue
         batch, _ = _extract_shows_from_home_response(data)
         shows.extend(batch)
         if batch:
-            print(f"  [more-like:{show_id}] +{len(batch)}")
-        time.sleep(0.3)
+            print(f"  [more-like:{show_id}] +{len(batch)}", flush=True)
+        time.sleep(0.5)
     return shows
 
 
