@@ -37,3 +37,4 @@ def response(flow: http.HTTPFlow):
 
     if is_kuku:
         print(f"[KUKU] {flow.request.method} {url[:120]}")
+
