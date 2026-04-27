@@ -3,7 +3,8 @@
 GO.py - One script that does EVERYTHING:
 1. Starts emulator (Medium_Phone - has Play Services)
 2. Waits for boot
-3. Pulls KukuTV APKs from device OR uses cached ones
+3. Uses APKs from apks/ folder (run scripts/setup_apk_downloader_avd.py first)
+   OR pulls KukuTV APKs live from the running emulator as a fallback
 4. Patches base.apk to trust mitmproxy (network security config)
 5. Resigns all APKs with debug key
 6. Installs patched KukuTV
@@ -11,6 +12,8 @@ GO.py - One script that does EVERYTHING:
 8. Turns proxy OFF so you can log in with OTP
 
 Run this in a terminal: python3 GO.py
+
+NOTE: For fresh APKs run:  python3 scripts/setup_apk_downloader_avd.py
 """
 import os, sys, subprocess, shutil, time, zipfile
 
@@ -19,8 +22,11 @@ ADB      = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
 EMULATOR = os.path.expanduser("~/Library/Android/sdk/emulator/emulator")
 BUILD    = os.path.expanduser("~/Library/Android/sdk/build-tools")
 PACKAGE  = "com.vlv.aravali.reels"
-APK_DIR  = "/tmp/kukutv_apks"
 HERE     = os.path.dirname(os.path.abspath(__file__))
+# Primary APK source: apks/ folder populated by setup_apk_downloader_avd.py
+APK_DIR  = os.path.join(HERE, "apks")
+# Fallback temp dir used when pulling live from device
+APK_TMP  = "/tmp/kukutv_apks"
 KEYSTORE = os.path.expanduser("~/.android/debug.keystore")
 SIGNED   = "/tmp/kuku_base_signed.apk"
 SPLITS_D = "/tmp/kuku_splits_signed"
@@ -72,16 +78,31 @@ else:
 
 # 2. APKs
 print("\n[2] APKs...")
-os.makedirs(APK_DIR, exist_ok=True)
-if "base.apk" not in os.listdir(APK_DIR):
+_apks_in_dir = lambda d: [f for f in os.listdir(d) if f.endswith('.apk')] if os.path.isdir(d) else []
+
+if _apks_in_dir(APK_DIR) and "base.apk" in _apks_in_dir(APK_DIR):
+    # ✓ Use pre-pulled APKs from apks/ folder (setup_apk_downloader_avd.py)
+    print(f"  ✓ Using apks/ folder ({len(_apks_in_dir(APK_DIR))} APKs)")
+else:
+    # Fallback: pull live from running emulator
+    if not _apks_in_dir(APK_DIR):
+        print("  apks/ folder is empty or missing.")
+        print("  TIP: Run  python3 scripts/setup_apk_downloader_avd.py  for a clean pull.")
+        print("  Falling back to live pull from emulator...")
+    os.makedirs(APK_TMP, exist_ok=True)
+    # Clear stale files
+    for f in os.listdir(APK_TMP):
+        os.remove(os.path.join(APK_TMP, f))
     o, _, _ = adb("shell", f"pm path {PACKAGE}", timeout=15)
     paths = [l.split("package:")[-1].strip() for l in o.splitlines() if "package:" in l]
-    if not paths: print("  ERROR: KukuTV not on device. Install from Play Store."); sys.exit(1)
+    if not paths:
+        print("  ERROR: KukuTV not on device and apks/ folder is empty.")
+        print("  Run:  python3 scripts/setup_apk_downloader_avd.py")
+        sys.exit(1)
     for p in paths:
-        adb("pull", p, os.path.join(APK_DIR, os.path.basename(p)))
+        adb("pull", p, os.path.join(APK_TMP, os.path.basename(p)))
         print(f"  Pulled {os.path.basename(p)}")
-else:
-    print(f"  Using cached ({len([f for f in os.listdir(APK_DIR) if f.endswith('.apk')])} APKs)")
+    APK_DIR = APK_TMP
 
 # 3. Compile NSC to binary XML using aapt2
 print("\n[3] Compiling network_security_config with aapt2...")
