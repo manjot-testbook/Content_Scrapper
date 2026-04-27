@@ -15,7 +15,9 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import local as thread_local
 
 import requests
 
@@ -31,10 +33,18 @@ API_BASE     = "https://api.kukufm.com"
 EPISODES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+_thread_local = thread_local()
+
 def build_session():
     s = requests.Session()
     s.headers.update(get_auth_headers())
     return s
+
+def get_thread_session():
+    """Per-thread session – thread-safe."""
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = build_session()
+    return _thread_local.session
 
 
 def safe_get(session, url, params=None, retries=3, backoff=2.0):
@@ -125,8 +135,7 @@ def already_scraped(show_id):
 
 def process_show(session, show_id, skip_existing=True):
     if skip_existing and already_scraped(show_id):
-        print(f"  [skip] Show {show_id}")
-        return None
+        return None   # silently skipped
     meta = fetch_show_details(session, show_id) or {"id": show_id}
     episodes = fetch_all_episodes(session, show_id)
     title = meta.get("title", f"show_{show_id}")
@@ -140,9 +149,8 @@ def process_show(session, show_id, skip_existing=True):
     return {"show_id": show_id, "title": title, "n_episodes": len(episodes)}
 
 
-def run(show_ids=None, limit=None, skip_existing=True):
+def run(show_ids=None, limit=None, skip_existing=True, workers=8):
     refresh_token_without_otp()
-    session = build_session()
 
     if show_ids:
         ids = show_ids
@@ -156,17 +164,36 @@ def run(show_ids=None, limit=None, skip_existing=True):
         if limit:
             ids = ids[:limit]
 
-    print(f"[episodes] Processing {len(ids)} series ...")
+    # Skip already-done shows before scheduling
+    pending = [sid for sid in ids
+               if not (skip_existing and already_scraped(sid))]
+    skipped = len(ids) - len(pending)
+    print(f"[episodes] {len(ids)} series total  |  "
+          f"{skipped} already done  |  {len(pending)} to fetch  |  "
+          f"{workers} workers")
+
     results = []
-    for idx, sid in enumerate(ids, 1):
-        print(f"[{idx}/{len(ids)}] show_id={sid}")
-        r = process_show(session, sid, skip_existing=skip_existing)
-        if r:
-            results.append(r)
-        time.sleep(0.3)
+    completed = 0
+
+    def _worker(sid):
+        sess = get_thread_session()
+        return process_show(sess, sid, skip_existing=False)  # already filtered above
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_worker, sid): sid for sid in pending}
+        for future in as_completed(futures):
+            completed += 1
+            try:
+                r = future.result()
+                if r:
+                    results.append(r)
+                    print(f"  [{completed}/{len(pending)}] done: {r['title']}")
+            except Exception as exc:
+                sid = futures[future]
+                print(f"  [{completed}/{len(pending)}] ERROR show {sid}: {exc}")
 
     total = sum(r["n_episodes"] for r in results)
-    print(f"\nDone: {len(results)} shows, {total} episodes -> {EPISODES_DIR}")
+    print(f"\nDone: {len(results)} shows scraped, {total} episodes  ->  {EPISODES_DIR}")
 
 
 if __name__ == "__main__":
@@ -174,6 +201,8 @@ if __name__ == "__main__":
     ap.add_argument("--show-id", type=int, nargs="+", help="Specific show ID(s)")
     ap.add_argument("--limit",   type=int,             help="Limit to first N series")
     ap.add_argument("--no-skip", action="store_true",  help="Re-scrape existing shows")
+    ap.add_argument("--workers", type=int, default=8,  help="Parallel download threads (default 8)")
     args = ap.parse_args()
-    run(show_ids=args.show_id, limit=args.limit, skip_existing=not args.no_skip)
+    run(show_ids=args.show_id, limit=args.limit,
+        skip_existing=not args.no_skip, workers=args.workers)
 

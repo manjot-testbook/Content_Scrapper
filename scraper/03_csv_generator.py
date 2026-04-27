@@ -25,6 +25,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import local as thread_local
 
 import requests
 
@@ -75,19 +76,19 @@ ALL_COLS = SHOW_COLS + EPISODE_COLS + CONTENT_COLS
 
 # ── HTTP helpers ───────────────────────────────────────────────────────────────
 
+_thread_local = thread_local()
+
 def _make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(get_auth_headers())
     return s
 
 
-_session = None
-
 def get_session() -> requests.Session:
-    global _session
-    if _session is None:
-        _session = _make_session()
-    return _session
+    """Per-thread session – avoids race conditions in ThreadPoolExecutor."""
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = _make_session()
+    return _thread_local.session
 
 
 def fetch_url(url: str, binary: bool = False, retries: int = 3) -> bytes | str | None:
@@ -238,7 +239,7 @@ def collect_episode_files() -> list[Path]:
 
 def run(out: Path = OUT_FILE,
         fetch_content: bool = True,
-        workers: int = 4,
+        workers: int = 12,
         limit_shows: int | None = None):
 
     files = collect_episode_files()
@@ -304,8 +305,8 @@ if __name__ == "__main__":
                     help="Output CSV path")
     ap.add_argument("--no-content",    action="store_true",
                     help="Skip downloading subtitle/script text (faster)")
-    ap.add_argument("--workers",       type=int, default=4,
-                    help="Parallel workers for content downloads (default 4)")
+    ap.add_argument("--workers",       type=int, default=12,
+                    help="Parallel workers for content downloads (default 12)")
     ap.add_argument("--limit-shows",   type=int,
                     help="Process only first N show files (for testing)")
     args = ap.parse_args()
